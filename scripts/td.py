@@ -81,8 +81,9 @@ def cmd_status(root):
 
 
 def cmd_peek(root, task_id, log_lines=20):
+    root = _root(root)
     td_dir = S.task_dir(root, task_id)
-    log = os.path.join(_root(root), "state", "workers", f"{task_id}.log")
+    log = os.path.join(root, "state", "workers", f"{task_id}.log")
     return "\n".join([
         "== progress.md ==", _read(os.path.join(td_dir, "progress.md")) or "(empty)",
         "== pending steer ==", _pending_steer(td_dir) or "(none)",
@@ -116,19 +117,42 @@ def _worker_pid(root, task_id):
     return int(pid) if pid else None
 
 
-def _kill_worker(root, task_id, sig=signal.SIGTERM):
-    pid = _worker_pid(root, task_id)
-    if pid is None:
-        return False
+def _alive(pid):
     try:
         os.kill(pid, 0)
-    except OSError:
-        return False  # not alive
-    try:
-        os.kill(pid, sig)
         return True
     except OSError:
         return False
+
+
+def _signal(pid, sig):
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        pass
+
+
+def _wait_dead(pid, timeout):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _alive(pid):
+            return True
+        time.sleep(0.05)
+    return not _alive(pid)
+
+
+def _kill_worker(root, task_id, timeout=10.0):
+    """SIGTERM the worker, wait for death, escalate to SIGKILL if needed.
+    Returns True once the pid is confirmed dead; False if no/already-dead pid
+    (or, in the worst case, still alive after SIGKILL+timeout)."""
+    pid = _worker_pid(root, task_id)
+    if pid is None or not _alive(pid):
+        return False
+    _signal(pid, signal.SIGTERM)
+    if _wait_dead(pid, timeout * 0.5):
+        return True
+    _signal(pid, signal.SIGKILL)
+    return _wait_dead(pid, timeout * 0.5)
 
 
 def _script(root, name):
@@ -217,6 +241,8 @@ def main(argv=None):
         cmd_steer(root, args.task_id, args.msg)
     elif args.cmd == "pause":
         cmd_pause(root, args.task_id)
+        if S.read(root, args.task_id).get("state") == "running":
+            print(f"note: {args.task_id} is running; pause takes effect only when it requeues", file=sys.stderr)
     elif args.cmd == "resume":
         cmd_resume(root, args.task_id)
     elif args.cmd == "redirect":

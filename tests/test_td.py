@@ -108,6 +108,37 @@ class SteerTest(unittest.TestCase):
         self.assertEqual(CP.read_new_steer(self.tmp, "t1").strip(), "")
 
 
+def _spawn_orphan(cmd):
+    """Double-fork so the new process is NOT a child of this process (adopted by
+    init/PID-1). This is necessary because os.kill(pid, 0) keeps returning True
+    for zombie children even after they die — orphans disappear from the process
+    table immediately, matching the production scenario where td never owns the
+    worker process."""
+    r, w = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(r)
+        grandchild = os.fork()
+        if grandchild == 0:
+            os.close(w)
+            os.execvp(cmd[0], cmd)
+            os._exit(1)
+        else:
+            os.write(w, f"{grandchild}\n".encode())
+            os.close(w)
+            os._exit(0)
+    os.close(w)
+    data = b""
+    while True:
+        chunk = os.read(r, 64)
+        if not chunk:
+            break
+        data += chunk
+    os.close(r)
+    os.waitpid(child, 0)
+    return int(data.strip())
+
+
 class InterveneTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -117,26 +148,37 @@ class InterveneTest(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _spawn_sleeper(self):
-        p = _sp.Popen(["sleep", "30"])
-        S.update(self.tmp, "t1", {"worker_pid": p.pid})
-        self.addCleanup(lambda: (p.kill(), p.wait()))
-        return p
+        pid = _spawn_orphan(["sleep", "30"])
+        S.update(self.tmp, "t1", {"worker_pid": pid})
+        self.addCleanup(lambda: (
+            (lambda: (os.kill(pid, 9) if td._alive(pid) else None))(),
+        ))
+        return pid
 
     def test_kill_worker_terminates_live_pid(self):
-        p = self._spawn_sleeper()
+        pid = self._spawn_sleeper()
         self.assertTrue(td._kill_worker(self.tmp, "t1"))
-        p.wait(timeout=5)
-        self.assertNotEqual(p.returncode, None)
+        self.assertFalse(td._alive(pid))
+
+    def test_kill_worker_escalates_to_sigkill(self):
+        # spawn a process that ignores SIGTERM — _kill_worker must escalate to SIGKILL
+        pid = _spawn_orphan(["bash", "-c", "trap '' TERM; sleep 30"])
+        S.update(self.tmp, "t1", {"worker_pid": pid})
+        self.addCleanup(lambda: (
+            (lambda: (os.kill(pid, 9) if td._alive(pid) else None))(),
+        ))
+        result = td._kill_worker(self.tmp, "t1", timeout=2.0)
+        self.assertTrue(result)
+        self.assertFalse(td._alive(pid))
 
     def test_kill_worker_false_when_no_pid(self):
         S.update(self.tmp, "t1", {"worker_pid": None})
         self.assertFalse(td._kill_worker(self.tmp, "t1"))
 
     def test_abort_requeue_resets_state_and_calls_reclaim(self):
-        p = self._spawn_sleeper()
+        self._spawn_sleeper()
         calls = []
         td.cmd_abort(self.tmp, "t1", mode="requeue", runner=lambda c, **k: calls.append(c))
-        p.wait(timeout=5)
         d = S.read(self.tmp, "t1")
         self.assertEqual(d["state"], "queued")
         self.assertIsNone(d["worker_pid"])
