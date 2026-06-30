@@ -205,6 +205,42 @@ def release(repo, path, root=None):
         save_state(pdir, state)
 
 
+def target_dir(entry):
+    return os.path.join(entry["path"], "target")
+
+
+def dir_size(path):
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(path):  # os.walk does not follow symlinks
+        for name in filenames:
+            fp = os.path.join(dirpath, name)
+            try:
+                if not os.path.islink(fp):
+                    total += os.path.getsize(fp)
+            except OSError:
+                pass
+    return total
+
+
+def disk_report(repo, root=None):
+    repo = os.path.abspath(repo)
+    pdir = pool_dir(repo, root)
+    with state_lock(pdir):
+        state = load_state(pdir)
+        _heal(repo, pdir, state)
+        save_state(pdir, state)
+    slots, total = [], 0
+    for e in state["entries"]:
+        td = target_dir(e)
+        b = dir_size(td)
+        total += b
+        mtime = int(os.path.getmtime(td)) if os.path.isdir(td) else 0
+        slots.append({"name": e["name"], "leased": e["leased"],
+                      "holder": e.get("lease_holder", ""),
+                      "target_bytes": b, "target_mtime": mtime, "path": e["path"]})
+    return {"slots": slots, "total_bytes": total}
+
+
 def status(repo, root=None):
     pdir = pool_dir(os.path.abspath(repo), root)
     with state_lock(pdir):
@@ -225,6 +261,7 @@ def main(argv=None):
     a = sub.add_parser("acquire"); a.add_argument("--repo", required=True); a.add_argument("--holder", required=True)
     rl = sub.add_parser("release"); rl.add_argument("--repo", required=True); rl.add_argument("--path", required=True)
     st = sub.add_parser("status"); st.add_argument("--repo", required=True)
+    dk = sub.add_parser("disk"); dk.add_argument("--repo", required=True)
     args = ap.parse_args(argv)
     if args.cmd == "acquire":
         print(acquire(args.repo, args.holder, root=args.root))
@@ -233,6 +270,12 @@ def main(argv=None):
     elif args.cmd == "status":
         for name, state_, holder, path in status(args.repo, root=args.root):
             print(f"{name}\t{state_}\t{holder}\t{path}")
+    elif args.cmd == "disk":
+        rep = disk_report(args.repo, root=args.root)
+        for s in rep["slots"]:
+            print(f"{s['name']}\t{'leased' if s['leased'] else 'idle'}\t"
+                  f"{s['holder']}\t{s['target_bytes']}\t{s['path']}")
+        print(f"TOTAL\t{rep['total_bytes']}")
 
 
 if __name__ == "__main__":
