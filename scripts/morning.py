@@ -39,9 +39,6 @@ KST = timezone(timedelta(hours=9))
 # failed 는 의도적으로 제외 — 조사/복구 여지가 있고 결과 보존이 불확실하므로 보호한다.
 GC_ELIGIBLE_STATES = {"done", "archived"}
 
-# 절대 GC 하지 않는 worktree 이름(사용자가 직접 만든 것 등 tokendance 소유 아님).
-PROTECTED_WORKTREE_NAMES = {"npu-pr-18434"}
-
 
 # ── 트리거 게이트 (KST 시각 + 하루 1회; librarian 과 달리 idle 불요) ──────────
 
@@ -137,7 +134,7 @@ def worktree_path(root, task_id):
 
 # ── GC 결정 (순수) ───────────────────────────────────────────────────────────
 
-def gc_precheck(task, *, current_task_id=None, protected_names=PROTECTED_WORKTREE_NAMES,
+def gc_precheck(task, *, current_task_id=None,
                 eligible_states=GC_ELIGIBLE_STATES):
     """facts 없이 가능한 싼 가드. ("eligible", None) 또는 ("skip", reason).
 
@@ -147,15 +144,13 @@ def gc_precheck(task, *, current_task_id=None, protected_names=PROTECTED_WORKTRE
     state = task.get("state")
     if current_task_id is not None and tid == current_task_id:
         return ("skip", "현재 실행 중인 워커 자신")
-    if tid in protected_names:
-        return ("skip", f"보호 대상 worktree({tid})")
     if state not in eligible_states:
         return ("skip", f"비종료 상태({state})")
     return ("eligible", None)
 
 
 def gc_decision(task, facts, *, current_task_id=None,
-                protected_names=PROTECTED_WORKTREE_NAMES, eligible_states=GC_ELIGIBLE_STATES):
+                eligible_states=GC_ELIGIBLE_STATES):
     """worktree GC 결정(순수). 반환 {"action", "remove_worktree", "remove_branch", "reason"}.
 
     action ∈ {"remove", "candidate", "skip"}.
@@ -167,7 +162,7 @@ def gc_decision(task, facts, *, current_task_id=None,
     로컬 branch 가 남아 있으면 그게 백업이므로, 머지/푸시 안 됐어도 worktree 는 회수해도 안전하다.
     """
     status, reason = gc_precheck(task, current_task_id=current_task_id,
-                                 protected_names=protected_names, eligible_states=eligible_states)
+                                 eligible_states=eligible_states)
     if status == "skip":
         return {"action": "skip", "remove_worktree": False, "remove_branch": False,
                 "reason": reason}
@@ -200,27 +195,48 @@ def gc_decision(task, facts, *, current_task_id=None,
 
 # ── 사실 수집 + 실행 (IO) ────────────────────────────────────────────────────
 
+def slot_path(root, task_id):
+    """현재 task 의 풀 슬롯 경로(state/tasks/<id>/worktree.path 에서 읽음).
+
+    파일이 없으면 빈 문자열을 반환(슬롯 미할당 / 이미 반환).
+    """
+    p = os.path.join(root, "state", "tasks", task_id, "worktree.path")
+    try:
+        with open(p) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 def gather_facts(root, task, runner=_run):
     repo = task.get("repo") or root
     branch = task.get("branch") or ""
-    wt = worktree_path(root, task["id"])
+    wt = slot_path(root, task["id"])
     return {
-        "worktree_exists": os.path.isdir(wt),
+        "worktree_exists": bool(wt) and os.path.isdir(wt),
         "branch_exists": branch_exists(repo, branch, runner),
         "branch_preserved": branch_preserved(repo, branch, runner) if branch else False,
     }
 
 
-def execute_gc(root, task, decision, runner=_run, log=lambda m: None, dry_run=False):
+def _default_reclaim(root, tid):
+    reclaim = os.path.join(root, "scripts", "reclaim-worktree.sh")
+    subprocess.run([reclaim, tid], check=True)
+
+
+def execute_gc(root, task, decision, runner=_run, log=lambda m: None, dry_run=False,
+               reclaim_fn=None):
     """decision.action == 'remove' 일 때만 worktree/브랜치를 제거. 실행(/예정) 단계 목록 반환.
 
     worktree 제거는 decision['remove_worktree'], branch 삭제는 decision['remove_branch'] 로
     독립적으로 게이트된다(둘 다 없으면 하위호환으로 True 취급). 미보존 done 은 remove_branch=False
     로 worktree 만 회수하고 로컬 branch 는 백업으로 남긴다.
 
-    안전: worktree 경로가 정확히 state/worktrees/<id> 일 때만 조작한다(ROOT/메인 체크아웃 불가침).
-    멱등: worktree 디렉토리/브랜치가 이미 없으면 해당 단계를 건너뛴다. 순서: worktree → branch.
-    dry_run=True 면 같은 단계 문자열을 만들되 mutating git 명령은 실행하지 않는다(미리보기).
+    worktree 회수: reclaim_fn(root, task_id) 를 호출해 풀 슬롯을 반환한다
+    (기본값은 reclaim-worktree.sh 호출; 테스트에서 교체 가능).
+    branch 삭제: git branch -D tokendance/<id> (변경 없음).
+    멱등: branch 가 이미 없으면 해당 단계를 건너뛴다.
+    dry_run=True 면 같은 단계 문자열을 만들되 mutating 명령은 실행하지 않는다(미리보기).
     """
     if decision.get("action") != "remove":
         return []
@@ -229,22 +245,14 @@ def execute_gc(root, task, decision, runner=_run, log=lambda m: None, dry_run=Fa
     tid = task["id"]
     repo = task.get("repo") or root
     branch = task.get("branch") or ""
-    wt = worktree_path(root, tid)
-    # 안전 가드: 해석된 경로가 정확히 state/worktrees 의 직계 자식이고 basename==tid 여야 한다.
-    # tid 에 '/'·'..' 가 섞여 경로를 탈출하면(예: ROOT/메인 체크아웃) 조작하지 않는다.
-    wt_abs = os.path.abspath(wt)
-    wroot = os.path.abspath(os.path.join(root, "state", "worktrees"))
-    if os.path.dirname(wt_abs) != wroot or os.path.basename(wt_abs) != tid:
-        log(f"GC 경로 가드: {wt_abs} 가 {wroot}/<id> 형태가 아님 — 건너뜀")
-        return []
+    _reclaim = reclaim_fn if reclaim_fn is not None else _default_reclaim
     prefix = "[dry-run] " if dry_run else ""
     steps = []
-    if remove_wt and os.path.isdir(wt):
+    if remove_wt:
         if not dry_run:
-            runner(["git", "-C", repo, "worktree", "remove", "--force", wt])
-            runner(["git", "-C", repo, "worktree", "prune"])
-        steps.append(f"{prefix}worktree 제거: {wt}")
-        log(f"GC {tid}: {prefix}worktree 제거 ({repo})")
+            _reclaim(root, tid)
+        steps.append(f"{prefix}worktree 슬롯 반환: {tid}")
+        log(f"GC {tid}: {prefix}worktree 슬롯 반환 (reclaim-worktree.sh)")
     if delete_br and branch and branch_exists(repo, branch, runner):
         if not dry_run:
             runner(["git", "-C", repo, "branch", "-D", branch])
@@ -253,10 +261,11 @@ def execute_gc(root, task, decision, runner=_run, log=lambda m: None, dry_run=Fa
     return steps
 
 
-def run_gc(root, tasks, *, current_task_id=None, runner=_run, log=lambda m: None, dry_run=False):
+def run_gc(root, tasks, *, current_task_id=None, runner=_run, log=lambda m: None, dry_run=False,
+           reclaim_fn=None):
     """모든 task 를 돌며 GC 결정 + (remove 면) 실행. 결과 레코드 목록 반환.
 
-    싼 가드(precheck)로 비종료/보호/자기자신을 먼저 걸러 git 호출을 아낀다.
+    싼 가드(precheck)로 비종료/자기자신을 먼저 걸러 git 호출을 아낀다.
     dry_run=True 면 결정만 하고 실제 제거는 하지 않는다(미리보기).
     """
     out = []
@@ -268,7 +277,8 @@ def run_gc(root, tasks, *, current_task_id=None, runner=_run, log=lambda m: None
             continue
         facts = gather_facts(root, t, runner)
         dec = gc_decision(t, facts, current_task_id=current_task_id)
-        steps = execute_gc(root, t, dec, runner=runner, log=log, dry_run=dry_run)
+        steps = execute_gc(root, t, dec, runner=runner, log=log, dry_run=dry_run,
+                           reclaim_fn=reclaim_fn)
         out.append({"task": t["id"], "state": t.get("state"),
                     "action": dec["action"], "reason": dec["reason"],
                     "remove_branch": dec.get("remove_branch", False), "steps": steps})

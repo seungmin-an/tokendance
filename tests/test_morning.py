@@ -100,11 +100,11 @@ class GcDecisionTest(unittest.TestCase):
         d = M.gc_decision(_task("t1", state="failed"), PRESERVED)
         self.assertEqual(d["action"], "skip")
 
-    def test_protected_worktree_name_never_removed(self):
-        # npu-pr-18434: 사용자 소유. 설사 done + 보존이어도 절대 건드리지 않는다.
+    def test_pool_owns_all_slots_no_protected_names(self):
+        # PROTECTED_WORKTREE_NAMES 제거됨 — 풀이 슬롯을 전담하므로 사용자 소유 worktree 특례 없음.
+        # done + 보존 → 정상 remove(pool release 로 반환됨).
         d = M.gc_decision(_task("npu-pr-18434"), PRESERVED)
-        self.assertEqual(d["action"], "skip")
-        self.assertIn("npu-pr-18434", d["reason"])
+        self.assertEqual(d["action"], "remove")
 
     def test_current_worker_self_protected(self):
         d = M.gc_decision(_task("t1"), PRESERVED, current_task_id="t1")
@@ -162,12 +162,13 @@ class BranchPreservedTest(unittest.TestCase):
         self.assertFalse(M.branch_preserved("/repo", "tokendance/x", runner=r))
 
 
-# ── execute_gc (injectable runner, 멱등, 경로 가드, 순서) ─────────────────────
+# ── execute_gc (injectable runner + reclaim_fn, 멱등, 순서) ───────────────────
 class ExecuteGcTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = self.tmp.name
         self.calls = []
+        self.reclaim_calls = []
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -180,48 +181,66 @@ class ExecuteGcTest(unittest.TestCase):
             return _ns(0)
         return run
 
+    def _reclaim(self):
+        def fn(root, tid):
+            self.reclaim_calls.append(tid)
+        return fn
+
     def _wt(self, tid):
-        p = os.path.join(self.root, "state", "worktrees", tid)
-        os.makedirs(p)
-        return p
+        """풀 슬롯 경로를 state/tasks/<id>/worktree.path 에 기록(새 레이아웃)."""
+        slot = os.path.join(self.root, "state", "pool", tid)
+        os.makedirs(slot)
+        task_dir = os.path.join(self.root, "state", "tasks", tid)
+        os.makedirs(task_dir, exist_ok=True)
+        with open(os.path.join(task_dir, "worktree.path"), "w") as f:
+            f.write(slot)
+        return slot
 
     def test_skip_action_does_nothing(self):
         self._wt("t1")
         steps = M.execute_gc(self.root, _task("t1"), {"action": "skip", "reason": "x"},
-                             runner=self._runner())
+                             runner=self._runner(), reclaim_fn=self._reclaim())
         self.assertEqual(steps, [])
         self.assertEqual(self.calls, [])
+        self.assertEqual(self.reclaim_calls, [])
 
-    def test_remove_issues_worktree_then_branch_in_order(self):
+    def test_remove_issues_reclaim_then_branch_in_order(self):
+        # reclaim 먼저(worktree 회수), 이후 branch -D 순서.
         self._wt("t1")
         steps = M.execute_gc(self.root, _task("t1", branch="tokendance/x"),
-                             {"action": "remove", "reason": "ok"}, runner=self._runner())
+                             {"action": "remove", "reason": "ok"},
+                             runner=self._runner(), reclaim_fn=self._reclaim())
         joined = [" ".join(c) for c in self.calls]
-        # worktree remove → prune → branch -D 순서.
-        self.assertTrue(any("worktree remove --force" in j for j in joined))
-        self.assertTrue(any("worktree prune" in j for j in joined))
-        i_remove = next(i for i, j in enumerate(joined) if "worktree remove" in j)
-        i_branch = next(i for i, j in enumerate(joined) if "branch -D" in j)
-        self.assertLess(i_remove, i_branch)
+        self.assertEqual(self.reclaim_calls, ["t1"])
+        self.assertTrue(any("branch -D" in j for j in joined))
+        # reclaim 이 branch -D 보다 먼저여야 한다(steps 순서로 확인).
+        i_reclaim = next(i for i, s in enumerate(steps) if "슬롯 반환" in s)
+        i_branch = next(i for i, s in enumerate(steps) if "브랜치 삭제" in s)
+        self.assertLess(i_reclaim, i_branch)
         self.assertEqual(len(steps), 2)
 
     def test_remove_worktree_only_keeps_branch(self):
-        # remove_branch=False → worktree 만 제거하고 branch -D 는 호출하지 않는다(백업 보존).
+        # remove_branch=False → reclaim 하되 branch -D 는 호출하지 않는다(백업 보존).
         self._wt("t1")
         steps = M.execute_gc(self.root, _task("t1", branch="tokendance/x"),
                              {"action": "remove", "remove_worktree": True,
                               "remove_branch": False, "reason": "worktree 회수(branch 보존)"},
-                             runner=self._runner())
+                             runner=self._runner(), reclaim_fn=self._reclaim())
         joined = [" ".join(c) for c in self.calls]
-        self.assertTrue(any("worktree remove" in j for j in joined))
+        self.assertEqual(self.reclaim_calls, ["t1"])
         self.assertFalse(any("branch -D" in j for j in joined))
         self.assertEqual(len(steps), 1)
 
     def test_idempotent_no_worktree_dir_only_branch(self):
-        # worktree 디렉토리 없음 → worktree 명령 생략, 브랜치만 삭제.
+        # worktree.path 파일 없음 → remove_worktree=True 이지만 reclaim 은 여전히 호출
+        # (reclaim 자체가 멱등 — worktree.path 없으면 no-op).
+        # branch 삭제는 정상 실행.
         steps = M.execute_gc(self.root, _task("t1", branch="tokendance/x"),
-                             {"action": "remove", "reason": "ok"}, runner=self._runner())
+                             {"action": "remove", "reason": "ok"},
+                             runner=self._runner(), reclaim_fn=self._reclaim())
         joined = [" ".join(c) for c in self.calls]
+        # reclaim 은 호출되나 git worktree remove 는 호출되지 않는다.
+        self.assertEqual(self.reclaim_calls, ["t1"])
         self.assertFalse(any("worktree remove" in j for j in joined))
         self.assertTrue(any("branch -D" in j for j in joined))
 
@@ -229,16 +248,11 @@ class ExecuteGcTest(unittest.TestCase):
         self._wt("t1")
         steps = M.execute_gc(self.root, _task("t1", branch="tokendance/x"),
                              {"action": "remove", "reason": "ok"},
-                             runner=self._runner(branch_present=False))
+                             runner=self._runner(branch_present=False),
+                             reclaim_fn=self._reclaim())
         joined = [" ".join(c) for c in self.calls]
+        self.assertEqual(self.reclaim_calls, ["t1"])
         self.assertFalse(any("branch -D" in j for j in joined))
-
-    def test_path_guard_refuses_outside_worktrees(self):
-        # worktree_path 가 state/worktrees/<id> 가 아니면(이론상) 절대 조작 안 함.
-        # id 에 경로탈출 시도 → 실제 경로가 기대 경로와 달라 무시.
-        steps = M.execute_gc(self.root, _task("../../evil", branch="b"),
-                             {"action": "remove", "reason": "ok"}, runner=self._runner())
-        self.assertEqual(steps, [])
 
 
 # ── run_gc end-to-end (temp root + fake runner) ──────────────────────────────
@@ -261,36 +275,57 @@ class RunGcTest(unittest.TestCase):
             return _ns(0)
         return run
 
-    def test_active_and_protected_skipped_without_git(self):
+    def test_active_states_skipped_without_git(self):
+        # 비종료 상태 task 는 precheck 에서 싸게 걸러진다(git 호출 없음).
         tasks = [
             _task("running-one", state="running"),
-            _task("npu-pr-18434", state="done"),
+            _task("queued-one", state="queued"),
         ]
         res = M.run_gc(self.root, tasks, runner=self._runner())
         actions = {r["task"]: r["action"] for r in res}
         self.assertEqual(actions["running-one"], "skip")
-        self.assertEqual(actions["npu-pr-18434"], "skip")
+        self.assertEqual(actions["queued-one"], "skip")
         # cheap-guard 로 걸러지므로 git 호출 0.
         self.assertEqual(self.calls, [])
 
-    def test_done_preserved_removed(self):
-        os.makedirs(os.path.join(self.root, "state", "worktrees", "done-one"))
-        res = M.run_gc(self.root, [_task("done-one")], runner=self._runner())
+    def _wt(self, tid):
+        """풀 슬롯 경로를 state/tasks/<id>/worktree.path 에 기록(새 레이아웃)."""
+        slot = os.path.join(self.root, "state", "pool", tid)
+        os.makedirs(slot)
+        task_dir = os.path.join(self.root, "state", "tasks", tid)
+        os.makedirs(task_dir, exist_ok=True)
+        with open(os.path.join(task_dir, "worktree.path"), "w") as f:
+            f.write(slot)
+        return slot
+
+    def test_done_preserved_reclaimed(self):
+        # done + 보존 → reclaim_fn 호출(풀 슬롯 반환).
+        reclaim_calls = []
+        def fake_reclaim(root, tid):
+            reclaim_calls.append(tid)
+        self._wt("done-one")
+        res = M.run_gc(self.root, [_task("done-one")], runner=self._runner(),
+                       reclaim_fn=fake_reclaim)
         self.assertEqual(res[0]["action"], "remove")
+        self.assertIn("done-one", reclaim_calls)
+        # git worktree remove 는 호출되지 않는다.
         joined = [" ".join(c) for c in self.calls]
-        self.assertTrue(any("worktree remove" in j for j in joined))
+        self.assertFalse(any("worktree remove" in j for j in joined))
 
     def test_dry_run_decides_but_does_not_mutate(self):
-        wt = os.path.join(self.root, "state", "worktrees", "done-one")
-        os.makedirs(wt)
-        res = M.run_gc(self.root, [_task("done-one")], runner=self._runner(), dry_run=True)
+        reclaim_calls = []
+        def fake_reclaim(root, tid):
+            reclaim_calls.append(tid)
+        slot = self._wt("done-one")
+        res = M.run_gc(self.root, [_task("done-one")], runner=self._runner(), dry_run=True,
+                       reclaim_fn=fake_reclaim)
         self.assertEqual(res[0]["action"], "remove")
         joined = [" ".join(c) for c in self.calls]
-        # mutating 명령(worktree remove / branch -D)은 호출되지 않는다.
-        self.assertFalse(any("worktree remove" in j for j in joined))
+        # mutating 명령(reclaim / branch -D)은 호출되지 않는다.
+        self.assertEqual(reclaim_calls, [])
         self.assertFalse(any("branch -D" in j for j in joined))
-        # 디렉토리도 그대로.
-        self.assertTrue(os.path.isdir(wt))
+        # 슬롯 디렉토리도 그대로.
+        self.assertTrue(os.path.isdir(slot))
         self.assertTrue(any("dry-run" in s for s in res[0]["steps"]))
 
 
