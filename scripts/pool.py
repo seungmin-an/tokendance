@@ -165,19 +165,25 @@ def acquire(repo, holder, root=None):
             return owned["path"]
         git(repo, "fetch", "origin", check=False)
         ref = default_ref(repo)
-        slot = next((e for e in state["entries"]
-                     if not e["leased"] and os.path.isdir(e["path"])
-                     and not is_dirty(e["path"])), None)
-        if slot is None:
-            if len(state["entries"]) >= max_trees(root):
-                raise RuntimeError(
-                    f"pool full ({max_trees(root)} slots); no idle slot for {holder}")
+        idle = [e for e in state["entries"]
+                if not e["leased"] and os.path.isdir(e["path"])
+                and not is_dirty(e["path"])]
+        # Prefer slots without an existing target/ — preserves warm caches.
+        # If all idle slots have target dirs and we're below capacity, grow the pool.
+        slot = next((e for e in idle if not os.path.isdir(target_dir(e))), None)
+        if slot is None and len(state["entries"]) < max_trees(root):
             name = _next_name(state)
             path = os.path.join(pdir, name)
             add_worktree(repo, path, ref)
             slot = {"name": name, "path": path, "created_at": int(time.time()),
                     "leased": False, "lease_holder": ""}
             state["entries"].append(slot)
+        if slot is None:
+            # All idle slots have targets; reuse the oldest-target-mtime one.
+            slot = next(iter(sorted(idle, key=lambda e: os.path.getmtime(target_dir(e)))), None)
+        if slot is None:
+            raise RuntimeError(
+                f"pool full ({max_trees(root)} slots); no idle slot for {holder}")
         reset_worktree(slot["path"], ref)
         git(slot["path"], "checkout", "-B", branch, ref)
         slot["leased"] = True
@@ -241,6 +247,79 @@ def disk_report(repo, root=None):
     return {"slots": slots, "total_bytes": total}
 
 
+def _cfg_float(key, root=None):
+    try:
+        return float(config.get(key, "0", r=root))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _evict_target(slot_path, idle_days, root=None):
+    td = os.path.join(slot_path, "target")
+    if not os.path.isdir(td):
+        return 0
+    freed = dir_size(td)
+    use_sweep = config.get("POOL_TARGET_USE_CARGO_SWEEP", "0", r=root) == "1"
+    if use_sweep and shutil.which("cargo-sweep"):
+        r = subprocess.run(["cargo", "sweep", "--time", str(max(1, idle_days))],
+                           cwd=slot_path, capture_output=True, text=True)
+        if r.returncode == 0:
+            return freed - dir_size(td)  # bytes actually reclaimed
+    shutil.rmtree(td, ignore_errors=True)
+    return freed
+
+
+def gc_targets(repo, root=None, *, now=None, dry_run=False):
+    if now is None:
+        now = time.time()
+    repo = os.path.abspath(repo)
+    pdir = pool_dir(repo, root)
+    idle_days = config.get_int("POOL_TARGET_IDLE_DAYS", r=root)
+    max_gb = _cfg_float("POOL_TARGET_MAX_GB", root)
+    low_gb = _cfg_float("POOL_TARGET_LOWWATER_GB", root) or (max_gb * 0.8)
+    acts = []
+    with state_lock(pdir):
+        state = load_state(pdir)
+        _heal(repo, pdir, state)
+        # idle (unleased) slots with an existing target/, newest-first by mtime
+        cand = []
+        for e in state["entries"]:
+            if e["leased"]:
+                continue
+            td = target_dir(e)
+            if not os.path.isdir(td):
+                continue
+            cand.append((e, dir_size(td), os.path.getmtime(td)))
+        evicted = set()
+        # Tier 1 — idle sweep
+        if idle_days > 0:
+            cutoff = now - idle_days * 86400
+            for e, b, mt in cand:
+                if mt <= cutoff:
+                    acts.append({"name": e["name"], "reason": f"idle ≥ {idle_days}d", "freed_bytes": b})
+                    if not dry_run:
+                        _evict_target(e["path"], idle_days, root)
+                    evicted.add(e["name"])
+        # Tier 2 — size-cap LRU backstop
+        if max_gb > 0:
+            total = sum(b for e, b, _ in cand if e["name"] not in evicted)
+            cap = int(max_gb * 1024**3)
+            low = int(low_gb * 1024**3)
+            if total > cap:
+                # coldest (oldest mtime) first
+                for e, b, mt in sorted((c for c in cand if c[0]["name"] not in evicted),
+                                       key=lambda c: c[2]):
+                    if total <= low:
+                        break
+                    acts.append({"name": e["name"], "reason": "size-cap LRU", "freed_bytes": b})
+                    if not dry_run:
+                        _evict_target(e["path"], idle_days, root)
+                    evicted.add(e["name"])
+                    total -= b
+        save_state(pdir, state)  # entries unchanged; heal may have pruned orphans
+    return acts
+
+
 def status(repo, root=None):
     pdir = pool_dir(os.path.abspath(repo), root)
     with state_lock(pdir):
@@ -262,6 +341,8 @@ def main(argv=None):
     rl = sub.add_parser("release"); rl.add_argument("--repo", required=True); rl.add_argument("--path", required=True)
     st = sub.add_parser("status"); st.add_argument("--repo", required=True)
     dk = sub.add_parser("disk"); dk.add_argument("--repo", required=True)
+    gt = sub.add_parser("gc-targets"); gt.add_argument("--repo", required=True)
+    gt.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
     if args.cmd == "acquire":
         print(acquire(args.repo, args.holder, root=args.root))
@@ -276,6 +357,13 @@ def main(argv=None):
             print(f"{s['name']}\t{'leased' if s['leased'] else 'idle'}\t"
                   f"{s['holder']}\t{s['target_bytes']}\t{s['path']}")
         print(f"TOTAL\t{rep['total_bytes']}")
+    elif args.cmd == "gc-targets":
+        acts = gc_targets(args.repo, root=args.root, dry_run=args.dry_run)
+        freed = 0
+        for a in acts:
+            print(f"{a['name']}\t{a['reason']}\t{a['freed_bytes']}")
+            freed += a["freed_bytes"]
+        print(f"FREED\t{freed}")
 
 
 if __name__ == "__main__":

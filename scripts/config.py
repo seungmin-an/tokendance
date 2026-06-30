@@ -20,6 +20,10 @@ DEFAULTS = {
     "MASTER_MORNING_HOUR_KST": "7",  # 마스터 아침 루틴(완료 worktree GC + 일일 다이제스트) KST 시각.
     "POOL_MAX_TREES": "4",            # warm worktree slots per target repo
     "POOL_SHARED_SYMLINKS": ".venv",  # comma-sep dirs symlinked (shared) into each slot
+    "POOL_TARGET_MAX_GB": "0",          # total target/ budget (GB) across slots; 0 = no size cap
+    "POOL_TARGET_LOWWATER_GB": "0",     # evict down to this (GB); 0 = derive 0.8 * max
+    "POOL_TARGET_IDLE_DAYS": "14",      # idle-sweep: evict idle slot target/ untouched ≥ this many days; 0 = off
+    "POOL_TARGET_USE_CARGO_SWEEP": "0", # 1 = use `cargo sweep` for idle sweep when available
 }
 
 
