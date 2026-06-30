@@ -205,6 +205,24 @@ def release(repo, path, root=None):
         save_state(pdir, state)
 
 
+def reclaim_stale(repo, root=None, *, keep_holders):
+    """Release leased slots whose holder is not in keep_holders. Returns reclaimed holders.
+
+    keep_holders is the set of holder ids the CALLER deems still alive (fresh heartbeat /
+    active task). pool.py stays free of task-state knowledge — morning.py computes the set."""
+    repo = os.path.abspath(repo)
+    pdir = pool_dir(repo, root)
+    with state_lock(pdir):
+        state = load_state(pdir)
+        stale = [e for e in state["entries"]
+                 if e["leased"] and e.get("lease_holder", "") not in keep_holders]
+    reclaimed = []
+    for e in stale:
+        release(repo, e["path"], root)   # release takes its own lock; reset + clear lease
+        reclaimed.append(e["lease_holder"])
+    return reclaimed
+
+
 def target_dir(entry):
     return os.path.join(entry["path"], "target")
 

@@ -110,3 +110,30 @@ class GcTargetsTest(unittest.TestCase):
         acts = pool.gc_targets(self.repo, root=self.tmp, dry_run=True)
         self.assertTrue(os.path.exists(os.path.join(p, "target")))  # nothing removed
         self.assertTrue(acts)  # but the action is reported
+
+
+class ReclaimStaleTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.repo = _init_repo(os.path.join(self.tmp, "repo"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _leased(self):
+        return {e["lease_holder"] for e in
+                pool.load_state(pool.pool_dir(self.repo, self.tmp))["entries"] if e["leased"]}
+
+    def test_reclaims_only_holders_not_in_keep_set(self):
+        pool.acquire(self.repo, "live", root=self.tmp)
+        pool.acquire(self.repo, "dead", root=self.tmp)
+        reclaimed = pool.reclaim_stale(self.repo, root=self.tmp, keep_holders={"live"})
+        self.assertEqual(reclaimed, ["dead"])
+        self.assertEqual(self._leased(), {"live"})
+
+    def test_keep_all_reclaims_nothing(self):
+        pool.acquire(self.repo, "a", root=self.tmp)
+        pool.acquire(self.repo, "b", root=self.tmp)
+        self.assertEqual(pool.reclaim_stale(self.repo, root=self.tmp,
+                                            keep_holders={"a", "b"}), [])
+        self.assertEqual(self._leased(), {"a", "b"})
