@@ -110,6 +110,48 @@ def cmd_steer(root, task_id, msg):
         f.write(f"\n[{_now()}] {msg}\n")
 
 
+def _worker_pid(root, task_id):
+    pid = S.read(root, task_id).get("worker_pid")
+    return int(pid) if pid else None
+
+
+def _kill_worker(root, task_id, sig=signal.SIGTERM):
+    pid = _worker_pid(root, task_id)
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False  # not alive
+    try:
+        os.kill(pid, sig)
+        return True
+    except OSError:
+        return False
+
+
+def _script(root, name):
+    return os.path.join(_root(root), "scripts", name)
+
+
+def cmd_redirect(root, task_id, msg, runner=subprocess.run):
+    cmd_steer(root, task_id, msg)
+    _kill_worker(root, task_id)
+    runner(["bash", _script(root, "launch-worker.sh"), task_id, "--resume"])
+
+
+def cmd_abort(root, task_id, mode="requeue", runner=subprocess.run):
+    _kill_worker(root, task_id)
+    runner(["bash", _script(root, "reclaim-worktree.sh"), task_id])
+    if mode == "fail":
+        S.update(root, task_id, {"state": "failed",
+                                 "failure_reason": "aborted by operator",
+                                 "worker_pid": None, "worker_session_id": None})
+    else:
+        S.update(root, task_id, {"state": "queued",
+                                 "worker_pid": None, "worker_session_id": None})
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="td", description="tokendance interactive control")
     ap.add_argument("--root", default=None)
@@ -120,6 +162,9 @@ def main(argv=None):
     sr = sub.add_parser("steer"); sr.add_argument("task_id"); sr.add_argument("msg")
     pa = sub.add_parser("pause"); pa.add_argument("task_id")
     re_ = sub.add_parser("resume"); re_.add_argument("task_id")
+    rd = sub.add_parser("redirect"); rd.add_argument("task_id"); rd.add_argument("msg")
+    ab = sub.add_parser("abort"); ab.add_argument("task_id")
+    ab.add_argument("--fail", action="store_true", help="mark failed instead of requeue")
     args = ap.parse_args(argv)
     root = _root(args.root)
     if args.cmd == "status":
@@ -136,6 +181,10 @@ def main(argv=None):
         cmd_pause(root, args.task_id)
     elif args.cmd == "resume":
         cmd_resume(root, args.task_id)
+    elif args.cmd == "redirect":
+        cmd_redirect(root, args.task_id, args.msg)
+    elif args.cmd == "abort":
+        cmd_abort(root, args.task_id, mode="fail" if args.fail else "requeue")
 
 
 if __name__ == "__main__":
