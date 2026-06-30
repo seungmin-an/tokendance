@@ -7,6 +7,22 @@ import tasks as TK
 import status as S
 import checkpoint as CP
 import cycle
+import pool
+
+
+def _init_repo(path):
+    os.makedirs(path, exist_ok=True)
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+    run = lambda *a: _sp.run(["git", "-C", path, *a], check=True,
+                             capture_output=True, text=True, env=env)
+    run("init", "-q", "-b", "main")
+    with open(os.path.join(path, ".gitignore"), "w") as f:
+        f.write("target/\n.venv\n")
+    with open(os.path.join(path, "README"), "w") as f:
+        f.write("hi\n")
+    run("add", "-A"); run("commit", "-q", "-m", "init")
+    return path
 
 
 class ReadCommandsTest(unittest.TestCase):
@@ -159,3 +175,36 @@ class SpawnTest(unittest.TestCase):
         tid = td.cmd_spawn(self.tmp, "/r", "do a thing")
         self.assertTrue(tid.endswith("-do-a-thing") or "do-a-thing" in tid)
         self.assertEqual(S.read(self.tmp, tid)["state"], "queued")
+
+
+class DiskGcTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.repo = _init_repo(os.path.join(self.tmp, "repo"))
+        TK.create_task(self.tmp, "t1", repo=self.repo)
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_disk_reports_repo_total(self):
+        p = pool.acquire(self.repo, "t1", root=self.tmp)
+        os.makedirs(os.path.join(p, "target"), exist_ok=True)
+        with open(os.path.join(p, "target", "c.bin"), "wb") as f:
+            f.write(b"x" * 4096)
+        rep = td.cmd_disk(self.tmp)
+        repos = {r[0]: r for r in rep}
+        self.assertIn(os.path.abspath(self.repo), repos)
+        self.assertEqual(repos[os.path.abspath(self.repo)][1], 4096)
+
+    def test_gc_dry_run_reports_without_freeing(self):
+        with open(os.path.join(self.tmp, "config.local.md"), "w") as f:
+            f.write("POOL_TARGET_IDLE_DAYS=1\n")
+        p = pool.acquire(self.repo, "t1", root=self.tmp)
+        pool.release(self.repo, p, root=self.tmp)
+        os.makedirs(os.path.join(p, "target"), exist_ok=True)
+        with open(os.path.join(p, "target", "c.bin"), "wb") as f:
+            f.write(b"x" * 100)
+        old = time.time() - 9 * 86400
+        os.utime(os.path.join(p, "target"), (old, old))
+        acts = td.cmd_gc(self.tmp, dry_run=True)
+        self.assertTrue(acts)  # reported
+        self.assertTrue(os.path.exists(os.path.join(p, "target")))  # not freed

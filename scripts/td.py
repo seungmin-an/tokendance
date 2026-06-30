@@ -164,6 +164,24 @@ def cmd_abort(root, task_id, mode="requeue", runner=subprocess.run):
                                  "worker_pid": None, "worker_session_id": None})
 
 
+def _repos(root):
+    return sorted({os.path.abspath(d["repo"]) for d in TK.list_tasks(root) if d.get("repo")})
+
+
+def cmd_disk(root, repo=None):
+    repos = [os.path.abspath(repo)] if repo else _repos(root)
+    return [(r, pool.disk_report(r, root=root)["total_bytes"],
+             pool.disk_report(r, root=root)["slots"]) for r in repos]
+
+
+def cmd_gc(root, repo=None, dry_run=False):
+    repos = [os.path.abspath(repo)] if repo else _repos(root)
+    acts = []
+    for r in repos:
+        acts += pool.gc_targets(r, root=root, dry_run=dry_run)
+    return acts
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="td", description="tokendance interactive control")
     ap.add_argument("--root", default=None)
@@ -179,6 +197,9 @@ def main(argv=None):
     ab.add_argument("--fail", action="store_true", help="mark failed instead of requeue")
     sp = sub.add_parser("spawn"); sp.add_argument("--repo", required=True)
     sp.add_argument("desc"); sp.add_argument("--id", default=None)
+    dk = sub.add_parser("disk"); dk.add_argument("--repo", default=None)
+    gc_ = sub.add_parser("gc"); gc_.add_argument("--repo", default=None)
+    gc_.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
     root = _root(args.root)
     if args.cmd == "status":
@@ -201,6 +222,15 @@ def main(argv=None):
         cmd_abort(root, args.task_id, mode="fail" if args.fail else "requeue")
     elif args.cmd == "spawn":
         print(cmd_spawn(root, args.repo, args.desc, task_id=args.id))
+    elif args.cmd == "disk":
+        for r, total, _slots in cmd_disk(root, repo=args.repo):
+            print(f"{os.path.basename(r):24} {total // (1024*1024):>8} MiB  {r}")
+    elif args.cmd == "gc":
+        acts = cmd_gc(root, repo=args.repo, dry_run=args.dry_run)
+        freed = sum(a.get("freed_bytes", 0) for a in acts)
+        for a in acts:
+            print(f"{a['name']}\t{a['reason']}\t{a['freed_bytes']}")
+        print(f"FREED\t{freed}")
 
 
 if __name__ == "__main__":
