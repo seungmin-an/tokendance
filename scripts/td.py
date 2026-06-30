@@ -96,6 +96,12 @@ def cmd_logs(root, task_id, follow=False):
     sys.stdout.write(_read(log) + "\n")
 
 
+def cmd_steer(root, task_id, msg):
+    td_dir = S.task_dir(root, task_id)
+    with open(os.path.join(td_dir, "steer.md"), "a") as f:
+        f.write(f"\n[{_now()}] {msg}\n")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="td", description="tokendance interactive control")
     ap.add_argument("--root", default=None)
@@ -103,6 +109,7 @@ def main(argv=None):
     sub.add_parser("status")
     pk = sub.add_parser("peek"); pk.add_argument("task_id"); pk.add_argument("-n", type=int, default=20)
     lg = sub.add_parser("logs"); lg.add_argument("task_id"); lg.add_argument("-f", action="store_true")
+    sr = sub.add_parser("steer"); sr.add_argument("task_id"); sr.add_argument("msg")
     args = ap.parse_args(argv)
     root = _root(args.root)
     if args.cmd == "status":
@@ -113,6 +120,8 @@ def main(argv=None):
         print(cmd_peek(root, args.task_id, log_lines=args.n))
     elif args.cmd == "logs":
         cmd_logs(root, args.task_id, follow=args.f)
+    elif args.cmd == "steer":
+        cmd_steer(root, args.task_id, args.msg)
 
 
 if __name__ == "__main__":

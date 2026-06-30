@@ -4,6 +4,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 import td
 import tasks as TK
 import status as S
+import checkpoint as CP
 
 
 class ReadCommandsTest(unittest.TestCase):
@@ -47,3 +48,18 @@ class ReadCommandsTest(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             td.cmd_logs(self.tmp, "t1", follow=False)
         self.assertIn("line2", buf.getvalue())
+
+
+class SteerTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(); TK.create_task(self.tmp, "t1", repo="/r")
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_steer_append_is_seen_by_checkpoint(self):
+        td.cmd_steer(self.tmp, "t1", "use bf16 not fp8")
+        # the worker's checkpoint consumes new steer past the cursor
+        seen = CP.read_new_steer(self.tmp, "t1")
+        self.assertIn("use bf16 not fp8", seen)
+        # second checkpoint sees nothing new (cursor advanced)
+        self.assertEqual(CP.read_new_steer(self.tmp, "t1").strip(), "")
