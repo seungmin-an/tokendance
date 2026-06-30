@@ -180,15 +180,14 @@ class AcquireReleaseTest(unittest.TestCase):
         self.assertEqual(len(st["entries"]), 1) # no second slot leaked
 
     def test_warm_target_survives_release(self):
-        # Invariant: git clean -fd (no -x) does NOT remove gitignored target/.
-        # The slot retains its warm cache after release so GC can manage it.
         p1 = pool.acquire(self.repo, "task-1", root=self.tmp)
         os.makedirs(os.path.join(p1, "target"))
         with open(os.path.join(p1, "target", "warm.bin"), "w") as f:
             f.write("cache")
         pool.release(self.repo, p1, root=self.tmp)
-        # warm.bin survives on its slot after release
-        self.assertTrue(os.path.exists(os.path.join(p1, "target", "warm.bin")))
+        p2 = pool.acquire(self.repo, "task-2", root=self.tmp)
+        self.assertEqual(p1, p2)  # reuses the same (only idle) slot
+        self.assertTrue(os.path.exists(os.path.join(p2, "target", "warm.bin")))
 
     def test_heal_reconciles_orphan_slot_after_lost_state(self):
         # Create slot "1", release it (dir + git registration remain), then wipe

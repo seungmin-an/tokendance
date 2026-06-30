@@ -165,25 +165,19 @@ def acquire(repo, holder, root=None):
             return owned["path"]
         git(repo, "fetch", "origin", check=False)
         ref = default_ref(repo)
-        idle = [e for e in state["entries"]
-                if not e["leased"] and os.path.isdir(e["path"])
-                and not is_dirty(e["path"])]
-        # Prefer slots without an existing target/ — preserves warm caches.
-        # If all idle slots have target dirs and we're below capacity, grow the pool.
-        slot = next((e for e in idle if not os.path.isdir(target_dir(e))), None)
-        if slot is None and len(state["entries"]) < max_trees(root):
+        slot = next((e for e in state["entries"]
+                     if not e["leased"] and os.path.isdir(e["path"])
+                     and not is_dirty(e["path"])), None)
+        if slot is None:
+            if len(state["entries"]) >= max_trees(root):
+                raise RuntimeError(
+                    f"pool full ({max_trees(root)} slots); no idle slot for {holder}")
             name = _next_name(state)
             path = os.path.join(pdir, name)
             add_worktree(repo, path, ref)
             slot = {"name": name, "path": path, "created_at": int(time.time()),
                     "leased": False, "lease_holder": ""}
             state["entries"].append(slot)
-        if slot is None:
-            # All idle slots have targets; reuse the oldest-target-mtime one.
-            slot = next(iter(sorted(idle, key=lambda e: os.path.getmtime(target_dir(e)))), None)
-        if slot is None:
-            raise RuntimeError(
-                f"pool full ({max_trees(root)} slots); no idle slot for {holder}")
         reset_worktree(slot["path"], ref)
         git(slot["path"], "checkout", "-B", branch, ref)
         slot["leased"] = True

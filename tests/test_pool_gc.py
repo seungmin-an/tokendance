@@ -65,18 +65,20 @@ class GcTargetsTest(unittest.TestCase):
             for k, v in kv.items():
                 f.write(f"{k}={v}\n")
 
-    def _idle_slot_with_target(self, holder, nbytes, age_days):
-        p = pool.acquire(self.repo, holder, root=self.tmp)
-        pool.release(self.repo, p, root=self.tmp)          # now idle
-        _write(os.path.join(p, "target", "c.bin"), nbytes)
-        old = time.time() - age_days * 86400
-        os.utime(os.path.join(p, "target"), (old, old))
-        return p
+    def _idle_slots(self, specs):
+        # specs: list of (holder, nbytes, age_days). Acquire all holders first so each
+        # gets a DISTINCT slot (all leased simultaneously), then release + plant targets.
+        paths = [pool.acquire(self.repo, h, root=self.tmp) for (h, _, _) in specs]
+        for p, (_, nbytes, age) in zip(paths, specs):
+            pool.release(self.repo, p, root=self.tmp)
+            _write(os.path.join(p, "target", "c.bin"), nbytes)
+            old = time.time() - age * 86400
+            os.utime(os.path.join(p, "target"), (old, old))
+        return paths
 
     def test_idle_sweep_evicts_old_target_only(self):
         self._cfg(POOL_TARGET_IDLE_DAYS=10, POOL_MAX_TREES=4)
-        old = self._idle_slot_with_target("t-old", 1000, age_days=30)
-        fresh = self._idle_slot_with_target("t-fresh", 1000, age_days=1)
+        old, fresh = self._idle_slots([("t-old", 1000, 30), ("t-fresh", 1000, 1)])
         acts = pool.gc_targets(self.repo, root=self.tmp)
         names = {a["name"] for a in acts}
         # old slot's target evicted; fresh slot's target kept
@@ -87,8 +89,7 @@ class GcTargetsTest(unittest.TestCase):
     def test_size_cap_evicts_coldest_until_under_lowwater(self):
         # cap 0.000003 GB ~ 3221 bytes; lowwater derived 0.8x ~ 2576
         self._cfg(POOL_TARGET_IDLE_DAYS=0, POOL_TARGET_MAX_GB=0.000003, POOL_MAX_TREES=4)
-        a = self._idle_slot_with_target("a", 2000, age_days=5)   # coldest
-        b = self._idle_slot_with_target("b", 2000, age_days=1)   # warmest
+        a, b = self._idle_slots([("a", 2000, 5), ("b", 2000, 1)])
         pool.gc_targets(self.repo, root=self.tmp)
         # total was 4000 > cap; coldest (a) evicted first → under lowwater, b kept
         self.assertFalse(os.path.exists(os.path.join(a, "target")))
@@ -105,7 +106,7 @@ class GcTargetsTest(unittest.TestCase):
 
     def test_dry_run_frees_nothing(self):
         self._cfg(POOL_TARGET_IDLE_DAYS=1)
-        p = self._idle_slot_with_target("t", 1000, age_days=9)
+        p, = self._idle_slots([("t", 1000, 9)])
         acts = pool.gc_targets(self.repo, root=self.tmp, dry_run=True)
         self.assertTrue(os.path.exists(os.path.join(p, "target")))  # nothing removed
         self.assertTrue(acts)  # but the action is reported
