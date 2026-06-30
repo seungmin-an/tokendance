@@ -135,6 +135,16 @@ def acquire(repo, holder, root=None):
     with state_lock(pdir):
         state = load_state(pdir)
         _heal(state)
+        # Idempotent per holder: if this holder already owns a live slot, return it
+        # as-is (preserve in-progress work; branch already checked out). Without this,
+        # launch-worker re-running prepare-worktree on --resume would leak the prior
+        # slot and reset the worker's working tree.
+        owned = next((e for e in state["entries"]
+                      if e["leased"] and e["lease_holder"] == holder
+                      and os.path.isdir(e["path"])), None)
+        if owned is not None:
+            apply_shared_symlinks(repo, owned["path"], root)
+            return owned["path"]
         git(repo, "fetch", "origin", check=False)
         ref = default_ref(repo)
         slot = next((e for e in state["entries"]

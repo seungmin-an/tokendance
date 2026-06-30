@@ -16,4 +16,7 @@ WT="$(echo "$OUT" | tail -n1)"
 [ -d "$WT" ] || { echo "FAIL: worktree dir missing: $WT"; exit 1; }
 [ -L "$WT/.venv" ] || { echo "FAIL: .venv not symlinked"; exit 1; }
 [ "$(git -C "$WT" rev-parse --abbrev-ref HEAD)" = "tokendance/task-1" ] || { echo "FAIL: wrong branch"; exit 1; }
+# idempotent: a second prepare for the same task returns the same slot (resume path)
+WT2="$("$TROOT/scripts/prepare-worktree.sh" task-1 | tail -n1)"
+[ "$WT2" = "$WT" ] || { echo "FAIL: prepare-worktree not idempotent: $WT2 != $WT"; exit 1; }
 echo "PASS"

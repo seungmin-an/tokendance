@@ -155,6 +155,17 @@ class AcquireReleaseTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             pool.acquire(self.repo, "task-2", root=self.tmp)
 
+    def test_reacquire_same_holder_is_idempotent(self):
+        p1 = pool.acquire(self.repo, "task-1", root=self.tmp)
+        marker = os.path.join(p1, "in_progress.txt")
+        with open(marker, "w") as f:
+            f.write("wip")
+        p2 = pool.acquire(self.repo, "task-1", root=self.tmp)
+        self.assertEqual(p1, p2)                # same slot, not a new lease
+        self.assertTrue(os.path.exists(marker)) # not reset — in-progress work preserved
+        st = pool.load_state(pool.pool_dir(self.repo, self.tmp))
+        self.assertEqual(len(st["entries"]), 1) # no second slot leaked
+
     def test_warm_target_survives_release(self):
         p1 = pool.acquire(self.repo, "task-1", root=self.tmp)
         os.makedirs(os.path.join(p1, "target"))
