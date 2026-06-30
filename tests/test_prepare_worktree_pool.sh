@@ -8,7 +8,7 @@ REPO="$TMP/repo"; mkdir -p "$REPO"; (cd "$REPO" && git init -q -b main && \
   git add -A && git -c user.email=t@t -c user.name=t commit -q -m init)
 mkdir -p "$REPO/.venv"
 # a task that points at REPO (use a throwaway tokendance ROOT = TMP/ROOT with scripts symlinked)
-TROOT="$TMP/troot"; mkdir -p "$TROOT/scripts" "$TROOT/state/tasks/task-1"
+TROOT="$TMP/troot"; mkdir -p "$TROOT/scripts"
 for s in pool.py config.py status.py prepare-worktree.sh; do cp "$ROOT/scripts/$s" "$TROOT/scripts/$s"; done
 python3 "$TROOT/scripts/status.py" --root "$TROOT" init task-1 --repo "$REPO"   # init sets state=queued
 OUT="$("$TROOT/scripts/prepare-worktree.sh" task-1)"

@@ -37,5 +37,6 @@ WT="$(python3 "$ROOT/scripts/pool.py" --root "$ROOT" acquire --repo "$REPO" --ho
 
 # Record branch + path for visibility/reclaim (unchanged contract).
 python3 "$ROOT/scripts/status.py" --root "$ROOT" set "$TASK_ID" --branch "tokendance/$TASK_ID" >/dev/null
+mkdir -p "$ROOT/state/tasks/$TASK_ID"
 echo "$WT" > "$ROOT/state/tasks/$TASK_ID/worktree.path"
 echo "$WT"
