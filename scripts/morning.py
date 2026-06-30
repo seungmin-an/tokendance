@@ -372,8 +372,14 @@ def build_digest(tasks, gc_actions, *, now_str,
 
     if pool_res is not None:
         L.append("")
-        L.append(f"🧹 풀 정리 — 슬롯 회수 {len(pool_res['reclaimed'])} · "
-                 f"target GC {len(pool_res['target_actions'])}건")
+        n_reclaimed = len(pool_res["reclaimed"])
+        n_actions = len(pool_res["target_actions"])
+        freed_mib = sum(a.get("freed_bytes", 0) for a in pool_res["target_actions"]) // (1024 * 1024)
+        L.append(f"🧹 풀 정리 — 슬롯 회수 {n_reclaimed} · target GC {n_actions}건 ({freed_mib} MiB 회수)")
+        if pool_res["reclaimed"]:
+            L.append(f"  • 회수된 슬롯: {', '.join(pool_res['reclaimed'])}")
+        if pool_res.get("failed"):
+            L.append(f"  • ⚠️ 정리 실패: {', '.join(os.path.basename(r) for r in pool_res['failed'])}")
         for repo, b in sorted(pool_res["disk"].items()):
             L.append(f"  • {os.path.basename(repo)}: target {b // (1024 * 1024)} MiB")
 
@@ -459,15 +465,21 @@ def pool_maintenance(root, tasks, *, now, log=lambda m: None, dry_run=False):
     repos = sorted({os.path.abspath(t["repo"]) for t in tasks if t.get("repo")}
                    | _repos_with_pools(root))
     keep = live_holders(tasks, now, ttl) if ttl else {}
-    reclaimed, target_actions, disk = [], [], {}
+    reclaimed, target_actions, disk, failed = [], [], {}, []
     for repo in repos:
-        if ttl and not dry_run:
-            reclaimed += POOL.reclaim_stale(repo, root=root,
-                                            keep_holders=keep.get(repo, set()))
-        target_actions += POOL.gc_targets(repo, root=root, now=now, dry_run=dry_run)
-        disk[repo] = POOL.disk_report(repo, root=root)["total_bytes"]
+        try:
+            if ttl and not dry_run:
+                reclaimed += POOL.reclaim_stale(repo, root=root,
+                                                keep_holders=keep.get(repo, set()))
+            target_actions += POOL.gc_targets(repo, root=root, now=now, dry_run=dry_run)
+            disk[repo] = POOL.disk_report(repo, root=root)["total_bytes"]
+        except Exception as e:
+            log(f"pool 정리 실패 ({os.path.basename(repo)}): {e}")
+            failed.append(repo)
+            continue
     log(f"pool 정리: 슬롯 회수 {len(reclaimed)} · target GC {len(target_actions)}건")
-    return {"reclaimed": reclaimed, "target_actions": target_actions, "disk": disk}
+    return {"reclaimed": reclaimed, "target_actions": target_actions, "disk": disk,
+            "failed": failed}
 
 
 # ── 통합 실행 (supervisor 가 호출) ───────────────────────────────────────────
@@ -501,7 +513,11 @@ def run_morning(root, now=None, post=True, runner=_run, log=_log, dry_run=False)
         now = datetime.now(timezone.utc)
     tasks = TK.list_tasks(root)
     gc_actions = run_gc(root, tasks, runner=runner, log=log, dry_run=dry_run)
-    pool_res = pool_maintenance(root, tasks, now=now.timestamp(), log=log, dry_run=dry_run)
+    try:
+        pool_res = pool_maintenance(root, tasks, now=now.timestamp(), log=log, dry_run=dry_run)
+    except Exception as e:
+        log(f"pool 정리 전체 실패: {e}")
+        pool_res = None
     text = build_digest(tasks, gc_actions, now_str=_kst_str(now),
                         note_fn=lambda d: _note(root, d), pool_res=pool_res)
     n_removed = sum(1 for a in gc_actions if a["action"] == "remove")
