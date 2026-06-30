@@ -5,6 +5,7 @@ import td
 import tasks as TK
 import status as S
 import checkpoint as CP
+import cycle
 
 
 class ReadCommandsTest(unittest.TestCase):
@@ -48,6 +49,31 @@ class ReadCommandsTest(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             td.cmd_logs(self.tmp, "t1", follow=False)
         self.assertIn("line2", buf.getvalue())
+
+
+class PauseTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        TK.create_task(self.tmp, "t1", repo="/r")  # state=queued
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_pause_sets_flag_and_dispatch_skips(self):
+        td.cmd_pause(self.tmp, "t1")
+        self.assertTrue(S.read(self.tmp, "t1").get("paused"))
+        launched = []
+        def fake_launcher(root, tid):
+            launched.append(tid); return True
+        cycle.dispatch_queued(self.tmp, fake_launcher, max_workers=4)
+        self.assertNotIn("t1", launched)  # paused → not dispatched
+
+    def test_resume_clears_flag_and_dispatch_proceeds(self):
+        td.cmd_pause(self.tmp, "t1"); td.cmd_resume(self.tmp, "t1")
+        self.assertFalse(S.read(self.tmp, "t1").get("paused"))
+        launched = []
+        cycle.dispatch_queued(self.tmp, lambda r, t: launched.append(t) or True, max_workers=4)
+        self.assertIn("t1", launched)
 
 
 class SteerTest(unittest.TestCase):

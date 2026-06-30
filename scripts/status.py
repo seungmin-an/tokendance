@@ -215,6 +215,8 @@ def main(argv=None):
     p.add_argument("--launched-now", action="store_true",
                    help="launched_at 을 현재 시각으로 기록(워커 디스패치 시점)")
     p.add_argument("--bump-attempts", action="store_true")
+    p.add_argument("--paused", dest="paused", action="store_true", default=None)
+    p.add_argument("--no-paused", dest="paused", action="store_false")
     p.add_argument("--expected-version", type=int)
 
     p = sub.add_parser("get")
@@ -242,6 +244,8 @@ def main(argv=None):
             changes["failure_reason"] = args.failure_reason
         if args.launched_now:
             changes["launched_at"] = _now()
+        if args.paused is not None:
+            changes["paused"] = args.paused
         print(json.dumps(update(args.root, args.task_id, changes,
                                 expected_version=args.expected_version,
                                 increment_attempts=args.bump_attempts)))

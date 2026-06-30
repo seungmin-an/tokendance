@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tasks as TK
 import config as C
 import inbox as IB
+import status as S
 
 
 def dispatch_queued(root, launcher, max_workers):
@@ -34,6 +35,8 @@ def dispatch_queued(root, launcher, max_workers):
     for tid in queued:
         if free <= 0:
             break
+        if S.read(root, tid).get("paused"):
+            continue
         if launcher(root, tid):
             dispatched.append(tid)
             free -= 1
