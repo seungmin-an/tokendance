@@ -3,6 +3,7 @@
 file-state protocol + warm pool. stdlib-only."""
 import argparse
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -140,6 +141,17 @@ def cmd_redirect(root, task_id, msg, runner=subprocess.run):
     runner(["bash", _script(root, "launch-worker.sh"), task_id, "--resume"])
 
 
+def _slug(s):
+    return re.sub(r"[^a-z0-9]+", "-", (s or "").lower()).strip("-")[:32] or "task"
+
+
+def cmd_spawn(root, repo, desc, task_id=None):
+    if task_id is None:
+        task_id = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%S}-{_slug(desc)}"
+    TK.create_task(root, task_id, title=desc, repo=os.path.abspath(repo))
+    return task_id
+
+
 def cmd_abort(root, task_id, mode="requeue", runner=subprocess.run):
     _kill_worker(root, task_id)
     runner(["bash", _script(root, "reclaim-worktree.sh"), task_id])
@@ -165,6 +177,8 @@ def main(argv=None):
     rd = sub.add_parser("redirect"); rd.add_argument("task_id"); rd.add_argument("msg")
     ab = sub.add_parser("abort"); ab.add_argument("task_id")
     ab.add_argument("--fail", action="store_true", help="mark failed instead of requeue")
+    sp = sub.add_parser("spawn"); sp.add_argument("--repo", required=True)
+    sp.add_argument("desc"); sp.add_argument("--id", default=None)
     args = ap.parse_args(argv)
     root = _root(args.root)
     if args.cmd == "status":
@@ -185,6 +199,8 @@ def main(argv=None):
         cmd_redirect(root, args.task_id, args.msg)
     elif args.cmd == "abort":
         cmd_abort(root, args.task_id, mode="fail" if args.fail else "requeue")
+    elif args.cmd == "spawn":
+        print(cmd_spawn(root, args.repo, args.desc, task_id=args.id))
 
 
 if __name__ == "__main__":

@@ -138,3 +138,24 @@ class InterveneTest(unittest.TestCase):
         td.cmd_redirect(self.tmp, "t1", "go investigate O-proj", runner=lambda c, **k: calls.append(c))
         self.assertIn("go investigate O-proj", CP.read_new_steer(self.tmp, "t1"))
         self.assertTrue(any("launch-worker.sh" in " ".join(c) and "--resume" in c for c in calls))
+
+
+class SpawnTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_spawn_creates_queued_task_with_repo_and_desc(self):
+        tid = td.cmd_spawn(self.tmp, "/repos/x", "fix the rope kernel", task_id="t-fixed")
+        self.assertEqual(tid, "t-fixed")
+        d = S.read(self.tmp, "t-fixed")
+        self.assertEqual(d["state"], "queued")
+        self.assertEqual(d["repo"], os.path.abspath("/repos/x"))
+        task_md = os.path.join(S.task_dir(self.tmp, "t-fixed"), "task.md")
+        self.assertIn("fix the rope kernel", open(task_md).read())
+
+    def test_spawn_generates_id_when_not_given(self):
+        tid = td.cmd_spawn(self.tmp, "/r", "do a thing")
+        self.assertTrue(tid.endswith("-do-a-thing") or "do-a-thing" in tid)
+        self.assertEqual(S.read(self.tmp, tid)["state"], "queued")
