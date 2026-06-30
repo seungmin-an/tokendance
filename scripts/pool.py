@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+import subprocess
 
 
 def _root(root=None):
@@ -55,3 +56,31 @@ def save_state(pdir, state):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, _state_path(pdir))
+
+
+def git(repo, *args, check=True):
+    return subprocess.run(["git", "-C", repo, *args], check=check,
+                          capture_output=True, text=True)
+
+
+def default_ref(repo):
+    r = git(repo, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD", check=False)
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip()
+    return git(repo, "rev-parse", "HEAD").stdout.strip()
+
+
+def is_dirty(wt):
+    r = git(wt, "status", "--porcelain", "--untracked-files=all")
+    return bool(r.stdout.strip())
+
+
+def add_worktree(repo, path, ref):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    git(repo, "worktree", "add", "--detach", "--force", path, ref)
+
+
+def reset_worktree(wt, ref):
+    git(wt, "checkout", "--detach", "--force", ref)
+    git(wt, "reset", "--hard", ref)
+    git(wt, "clean", "-fd")  # NOTE: no -x — preserves gitignored target/ + .venv symlink
