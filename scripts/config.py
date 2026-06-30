@@ -18,6 +18,8 @@ DEFAULTS = {
     "MASTER_SESSION_MAX_CYCLES": "20",  # 마스터 세션을 이만큼 이어간 뒤 리셋(맥락은 롤링노트가 인계)
     "LIBRARIAN_HOUR_KST": "3",  # 사서(지식 큐레이션) 패스를 도는 KST 시각(새벽). idle 일 때만.
     "MASTER_MORNING_HOUR_KST": "7",  # 마스터 아침 루틴(완료 worktree GC + 일일 다이제스트) KST 시각.
+    "POOL_MAX_TREES": "4",            # warm worktree slots per target repo
+    "POOL_SHARED_SYMLINKS": ".venv",  # comma-sep dirs symlinked (shared) into each slot
 }
 
 
@@ -39,6 +41,7 @@ def paths(r=None):
         "reports": j(r, "state", "reports"),
         "workers": j(r, "state", "workers"),
         "worktrees": j(r, "state", "worktrees"),
+        "pool": j(r, "state", "pool"),
         "library": j(r, "library"),
         "config_local": j(r, "config.local.md"),
         "slack_cursor": j(r, "state", "slack.cursor"),

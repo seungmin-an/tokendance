@@ -9,6 +9,11 @@ import json
 import os
 import subprocess
 
+try:
+    from scripts import config
+except ImportError:  # running with scripts/ on sys.path
+    import config
+
 
 def _root(root=None):
     return root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -84,3 +89,22 @@ def reset_worktree(wt, ref):
     git(wt, "checkout", "--detach", "--force", ref)
     git(wt, "reset", "--hard", ref)
     git(wt, "clean", "-fd")  # NOTE: no -x — preserves gitignored target/ + .venv symlink
+
+
+def shared_dirs(root=None):
+    raw = config.get("POOL_SHARED_SYMLINKS", ".venv", r=root)
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
+def apply_shared_symlinks(repo, wt, root=None):
+    for rel in shared_dirs(root):
+        src = os.path.join(repo, rel)
+        if not os.path.exists(src):
+            continue
+        dst = os.path.join(wt, rel)
+        if os.path.islink(dst):
+            os.unlink(dst)
+        elif os.path.exists(dst):
+            continue  # real tracked content — leave it
+        os.makedirs(os.path.dirname(dst) or wt, exist_ok=True)
+        os.symlink(src, dst)

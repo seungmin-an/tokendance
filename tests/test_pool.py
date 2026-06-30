@@ -87,5 +87,32 @@ class GitTest(unittest.TestCase):
         self.assertFalse(pool.is_dirty(wt))
 
 
+class SymlinkTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.repo = os.path.join(self.tmp, "repo")
+        os.makedirs(os.path.join(self.repo, ".venv", "bin"))
+        self.wt = os.path.join(self.tmp, "wt")
+        os.makedirs(self.wt)
+
+    def test_symlinks_existing_shared_dir(self):
+        pool.apply_shared_symlinks(self.repo, self.wt, root=self.tmp)
+        link = os.path.join(self.wt, ".venv")
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(os.path.realpath(link),
+                         os.path.realpath(os.path.join(self.repo, ".venv")))
+
+    def test_skips_missing_shared_dir(self):
+        # no target/ in repo → no link created, no error
+        pool.apply_shared_symlinks(self.repo, self.wt, root=self.tmp)
+        self.assertFalse(os.path.exists(os.path.join(self.wt, "target")))
+
+    def test_replaces_stale_link(self):
+        os.symlink("/nonexistent", os.path.join(self.wt, ".venv"))
+        pool.apply_shared_symlinks(self.repo, self.wt, root=self.tmp)
+        self.assertEqual(os.path.realpath(os.path.join(self.wt, ".venv")),
+                         os.path.realpath(os.path.join(self.repo, ".venv")))
+
+
 if __name__ == "__main__":
     unittest.main()
