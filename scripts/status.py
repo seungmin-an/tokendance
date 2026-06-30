@@ -215,6 +215,7 @@ def main(argv=None):
     p.add_argument("--launched-now", action="store_true",
                    help="launched_at 을 현재 시각으로 기록(워커 디스패치 시점)")
     p.add_argument("--bump-attempts", action="store_true")
+    # default=None: omitting both leaves 'paused' unchanged (store_true/false share dest)
     p.add_argument("--paused", dest="paused", action="store_true", default=None)
     p.add_argument("--no-paused", dest="paused", action="store_false")
     p.add_argument("--expected-version", type=int)

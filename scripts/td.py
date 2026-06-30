@@ -82,7 +82,7 @@ def cmd_status(root):
 
 def cmd_peek(root, task_id, log_lines=20):
     td_dir = S.task_dir(root, task_id)
-    log = os.path.join(root, "state", "workers", f"{task_id}.log")
+    log = os.path.join(_root(root), "state", "workers", f"{task_id}.log")
     return "\n".join([
         "== progress.md ==", _read(os.path.join(td_dir, "progress.md")) or "(empty)",
         "== pending steer ==", _pending_steer(td_dir) or "(none)",
@@ -107,8 +107,8 @@ def cmd_resume(root, task_id):
 
 def cmd_steer(root, task_id, msg):
     td_dir = S.task_dir(root, task_id)
-    with open(os.path.join(td_dir, "steer.md"), "a") as f:
-        f.write(f"\n[{_now()}] {msg}\n")
+    with open(os.path.join(td_dir, "steer.md"), "ab") as f:
+        f.write(f"\n[{_now()}] {msg}\n".encode("utf-8"))
 
 
 def _worker_pid(root, task_id):
@@ -170,8 +170,11 @@ def _repos(root):
 
 def cmd_disk(root, repo=None):
     repos = [os.path.abspath(repo)] if repo else _repos(root)
-    return [(r, pool.disk_report(r, root=root)["total_bytes"],
-             pool.disk_report(r, root=root)["slots"]) for r in repos]
+    result = []
+    for r in repos:
+        rep = pool.disk_report(r, root=root)
+        result.append((r, rep["total_bytes"], rep["slots"]))
+    return result
 
 
 def cmd_gc(root, repo=None, dry_run=False):
@@ -221,7 +224,10 @@ def main(argv=None):
     elif args.cmd == "abort":
         cmd_abort(root, args.task_id, mode="fail" if args.fail else "requeue")
     elif args.cmd == "spawn":
-        print(cmd_spawn(root, args.repo, args.desc, task_id=args.id))
+        try:
+            print(cmd_spawn(root, args.repo, args.desc, task_id=args.id))
+        except ValueError as e:
+            print(f"td spawn: {e}", file=sys.stderr); raise SystemExit(1)
     elif args.cmd == "disk":
         for r, total, _slots in cmd_disk(root, repo=args.repo):
             print(f"{os.path.basename(r):24} {total // (1024*1024):>8} MiB  {r}")
@@ -229,7 +235,7 @@ def main(argv=None):
         acts = cmd_gc(root, repo=args.repo, dry_run=args.dry_run)
         freed = sum(a.get("freed_bytes", 0) for a in acts)
         for a in acts:
-            print(f"{a['name']}\t{a['reason']}\t{a['freed_bytes']}")
+            print(f"{a['name']}\t{a['reason']}\t{a.get('freed_bytes', 0)}")
         print(f"FREED\t{freed}")
 
 

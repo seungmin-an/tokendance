@@ -119,6 +119,7 @@ class InterveneTest(unittest.TestCase):
     def _spawn_sleeper(self):
         p = _sp.Popen(["sleep", "30"])
         S.update(self.tmp, "t1", {"worker_pid": p.pid})
+        self.addCleanup(lambda: (p.kill(), p.wait()))
         return p
 
     def test_kill_worker_terminates_live_pid(self):
@@ -169,7 +170,8 @@ class SpawnTest(unittest.TestCase):
         self.assertEqual(d["state"], "queued")
         self.assertEqual(d["repo"], os.path.abspath("/repos/x"))
         task_md = os.path.join(S.task_dir(self.tmp, "t-fixed"), "task.md")
-        self.assertIn("fix the rope kernel", open(task_md).read())
+        with open(task_md) as f:
+            self.assertIn("fix the rope kernel", f.read())
 
     def test_spawn_generates_id_when_not_given(self):
         tid = td.cmd_spawn(self.tmp, "/r", "do a thing")
