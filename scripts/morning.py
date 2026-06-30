@@ -25,12 +25,14 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tasks as TK
 import slack as SL
 import status as S
+import pool as POOL
 
 KST = timezone(timedelta(hours=9))
 
@@ -297,7 +299,8 @@ def _title_suffix(d):
 
 
 def build_digest(tasks, gc_actions, *, now_str,
-                 note_fn=lambda d: d.get("failure_reason") or ""):
+                 note_fn=lambda d: d.get("failure_reason") or "",
+                 pool_res=None):
     """아침 다이제스트 텍스트(순수).
 
     작업을 3 분류로 묶어 보여준다(steer 2026-06-26):
@@ -367,7 +370,104 @@ def build_digest(tasks, gc_actions, *, now_str,
         for a in candidates:
             L.append(f"  • {a['task']} — {a['reason']}")
 
+    if pool_res is not None:
+        L.append("")
+        L.append(f"🧹 풀 정리 — 슬롯 회수 {len(pool_res['reclaimed'])} · "
+                 f"target GC {len(pool_res['target_actions'])}건")
+        for repo, b in sorted(pool_res["disk"].items()):
+            L.append(f"  • {os.path.basename(repo)}: target {b // (1024 * 1024)} MiB")
+
     return "\n".join(L) + "\n"
+
+
+# ── 풀 유지보수 (pool GC + stale-lease reclaim) ─────────────────────────────
+
+def _hb_epoch(hb):
+    """Parse status heartbeat ('%Y-%m-%dT%H:%M:%SZ') to epoch; None/bad → 0."""
+    if not hb:
+        return 0.0
+    try:
+        return datetime.strptime(hb, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def live_holders(tasks, now, ttl_hours):
+    """Per-repo set of holder ids to KEEP: heartbeat newer than ttl_hours."""
+    keep = {}
+    cutoff = now - ttl_hours * 3600
+    for t in tasks:
+        repo = t.get("repo")
+        if not repo:
+            continue
+        repo_abs = os.path.abspath(repo)
+        if _hb_epoch(t.get("heartbeat")) >= cutoff:
+            keep.setdefault(repo_abs, set()).add(t["id"])
+        else:
+            keep.setdefault(repo_abs, set())  # ensure repo key exists
+    return keep
+
+
+def _repos_with_pools(root):
+    """Repos that have a pool dir even if no task currently lists them (orphan leases).
+
+    We recover the repo path from the worktree's git metadata: each slot is a linked
+    worktree, so `git worktree list` on the slot gives us the main repo path.
+    """
+    base = os.path.join(root, "state", "pool")
+    if not os.path.isdir(base):
+        return set()
+    repos = set()
+    for repo_key in os.listdir(base):
+        pdir = os.path.join(base, repo_key)
+        if not os.path.isdir(pdir):
+            continue
+        state = POOL.load_state(pdir)
+        for e in state.get("entries", []):
+            slot = e.get("path", "")
+            if not os.path.isdir(slot):
+                continue
+            try:
+                r = subprocess.run(
+                    ["git", "-C", slot, "worktree", "list", "--porcelain"],
+                    capture_output=True, text=True)
+                if r.returncode != 0:
+                    continue
+                for line in r.stdout.splitlines():
+                    if line.startswith("worktree "):
+                        candidate = line[len("worktree "):].strip()
+                        # The main worktree is the first listed; its path is the repo.
+                        repos.add(os.path.abspath(candidate))
+                        break  # first worktree = main repo
+            except Exception:
+                pass
+            break  # one slot per pool dir is enough to find the repo
+    return repos
+
+
+def pool_maintenance(root, tasks, *, now, log=lambda m: None, dry_run=False):
+    """Run stale-lease reclaim + target GC for each repo referenced in tasks.
+
+    Returns {"reclaimed": [...], "target_actions": [...], "disk": {repo: total_bytes}}.
+    """
+    try:
+        import config as _cfg
+        ttl = _cfg.get_int("POOL_LEASE_TTL_HOURS", r=root)
+    except Exception:
+        ttl = 0
+    repos = sorted({os.path.abspath(t["repo"]) for t in tasks if t.get("repo")}
+                   | _repos_with_pools(root))
+    keep = live_holders(tasks, now, ttl) if ttl else {}
+    reclaimed, target_actions, disk = [], [], {}
+    for repo in repos:
+        if ttl and not dry_run:
+            reclaimed += POOL.reclaim_stale(repo, root=root,
+                                            keep_holders=keep.get(repo, set()))
+        target_actions += POOL.gc_targets(repo, root=root, now=now, dry_run=dry_run)
+        disk[repo] = POOL.disk_report(repo, root=root)["total_bytes"]
+    log(f"pool 정리: 슬롯 회수 {len(reclaimed)} · target GC {len(target_actions)}건")
+    return {"reclaimed": reclaimed, "target_actions": target_actions, "disk": disk}
 
 
 # ── 통합 실행 (supervisor 가 호출) ───────────────────────────────────────────
@@ -401,8 +501,9 @@ def run_morning(root, now=None, post=True, runner=_run, log=_log, dry_run=False)
         now = datetime.now(timezone.utc)
     tasks = TK.list_tasks(root)
     gc_actions = run_gc(root, tasks, runner=runner, log=log, dry_run=dry_run)
+    pool_res = pool_maintenance(root, tasks, now=now.timestamp(), log=log, dry_run=dry_run)
     text = build_digest(tasks, gc_actions, now_str=_kst_str(now),
-                        note_fn=lambda d: _note(root, d))
+                        note_fn=lambda d: _note(root, d), pool_res=pool_res)
     n_removed = sum(1 for a in gc_actions if a["action"] == "remove")
     n_cand = sum(1 for a in gc_actions if a["action"] == "candidate")
     log(f"아침 루틴{' [dry-run]' if dry_run else ''}: GC 제거 {n_removed} · "
