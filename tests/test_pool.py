@@ -1,6 +1,7 @@
 # tests/test_pool.py
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,9 @@ class StateTest(unittest.TestCase):
         self.repo = os.path.join(self.tmp, "myrepo")
         os.makedirs(self.repo)
 
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
     def test_pool_dir_is_stable_and_repo_keyed(self):
         d1 = pool.pool_dir(self.repo, root=self.tmp)
         d2 = pool.pool_dir(self.repo, root=self.tmp)
@@ -60,6 +64,9 @@ class GitTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.repo = _init_repo(os.path.join(self.tmp, "repo"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_default_ref_returns_head_without_origin(self):
         ref = pool.default_ref(self.repo)
@@ -96,6 +103,9 @@ class SymlinkTest(unittest.TestCase):
         self.wt = os.path.join(self.tmp, "wt")
         os.makedirs(self.wt)
 
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
     def test_symlinks_existing_shared_dir(self):
         pool.apply_shared_symlinks(self.repo, self.wt, root=self.tmp)
         link = os.path.join(self.wt, ".venv")
@@ -124,6 +134,9 @@ class AcquireReleaseTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.repo = _init_repo(os.path.join(self.tmp, "repo"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_acquire_creates_slot_on_task_branch(self):
         path = pool.acquire(self.repo, "task-1", root=self.tmp)
@@ -175,6 +188,16 @@ class AcquireReleaseTest(unittest.TestCase):
         p2 = pool.acquire(self.repo, "task-2", root=self.tmp)
         self.assertTrue(os.path.exists(os.path.join(p2, "target", "warm.bin")))
 
+    def test_heal_reconciles_orphan_slot_after_lost_state(self):
+        # Create slot "1", release it (dir + git registration remain), then wipe
+        # state.json to simulate a crash before save. Next acquire must NOT raise.
+        p1 = pool.acquire(self.repo, "task-1", root=self.tmp)
+        pool.release(self.repo, p1, root=self.tmp)
+        os.remove(os.path.join(pool.pool_dir(self.repo, self.tmp), "state.json"))
+        p2 = pool.acquire(self.repo, "task-2", root=self.tmp)   # must not raise exit-128
+        self.assertTrue(os.path.isdir(p2))
+        self.assertEqual(_branch(p2), "tokendance/task-2")
+
 
 class CliTest(unittest.TestCase):
     def setUp(self):
@@ -182,6 +205,9 @@ class CliTest(unittest.TestCase):
         self.repo = _init_repo(os.path.join(self.tmp, "repo"))
         self.script = os.path.join(os.path.dirname(os.path.dirname(__file__)),
                                    "scripts", "pool.py")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _run(self, *args):
         return subprocess.run([sys.executable, self.script, "--root", self.tmp, *args],

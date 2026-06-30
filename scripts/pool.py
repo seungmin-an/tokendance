@@ -8,7 +8,9 @@ import fcntl
 import hashlib
 import json
 import os
+import shutil
 import subprocess
+import sys
 import time
 
 try:
@@ -116,8 +118,24 @@ def max_trees(root=None):
     return config.get_int("POOL_MAX_TREES", r=root)
 
 
-def _heal(state):
+def _heal(repo, pdir, state):
+    # Drop state entries whose worktree dir is gone.
     state["entries"] = [e for e in state["entries"] if os.path.isdir(e["path"])]
+    # Reconcile the filesystem: a crash between add_worktree and save_state can
+    # leave an orphan slot dir (on disk + git-registered) absent from state.json.
+    # Without removing it, _next_name re-picks its name and `git worktree add`
+    # fails (exit 128), wedging all future acquires. Remove orphans so re-create
+    # is clean.
+    git(repo, "worktree", "prune", check=False)
+    known = {os.path.abspath(e["path"]) for e in state["entries"]}
+    if os.path.isdir(pdir):
+        for name in sorted(os.listdir(pdir)):
+            p = os.path.join(pdir, name)
+            if not os.path.isdir(p) or os.path.abspath(p) in known:
+                continue  # skip state.json/.lock files and known slots
+            git(repo, "worktree", "remove", "--force", p, check=False)
+            shutil.rmtree(p, ignore_errors=True)
+    git(repo, "worktree", "prune", check=False)
 
 
 def _next_name(state):
@@ -134,7 +152,7 @@ def acquire(repo, holder, root=None):
     branch = f"tokendance/{holder}"
     with state_lock(pdir):
         state = load_state(pdir)
-        _heal(state)
+        _heal(repo, pdir, state)
         # Idempotent per holder: if this holder already owns a live slot, return it
         # as-is (preserve in-progress work; branch already checked out). Without this,
         # launch-worker re-running prepare-worktree on --resume would leak the prior
@@ -182,6 +200,8 @@ def release(repo, path, root=None):
                 e["leased"] = False
                 e["lease_holder"] = ""
                 break
+        else:
+            print(f"[pool] release: path not in pool: {path}", file=sys.stderr)
         save_state(pdir, state)
 
 
@@ -189,7 +209,7 @@ def status(repo, root=None):
     pdir = pool_dir(os.path.abspath(repo), root)
     with state_lock(pdir):
         state = load_state(pdir)
-        _heal(state)
+        _heal(os.path.abspath(repo), pdir, state)
         save_state(pdir, state)
     rows = []
     for e in state["entries"]:

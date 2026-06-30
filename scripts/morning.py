@@ -9,10 +9,9 @@
   1. 완료 worktree GC — done(또는 archived)이고 결과가 보존된(브랜치가 base 에 머지됐거나
      remote 에 push 된) task 의 worktree + 로컬 task 브랜치를 제거. 안전 최우선:
        - 비종료 상태(running/needs_human/review/queued/blocked) task 는 절대 안 건드림.
-       - PROTECTED_WORKTREE_NAMES(예: npu-pr-18434, 사용자 소유)는 제외.
        - 현재 실행 중인 워커 자신(current_task_id)도 제외.
        - 결과 미보존이면 삭제하지 않고 다이제스트에 "정리 후보(수동확인)"로 표기.
-       - state/worktrees/<id> 경로일 때만 조작(ROOT/메인 체크아웃 불가침). 멱등.
+       - worktree 회수는 scripts/reclaim-worktree.sh 를 통해 풀 슬롯을 반환한다. 멱등.
   2. 일일 다이제스트 — 들고있는 작업(running/queued/review) + 사람 확인 필요(needs_human,
      대기사유 한 줄) + 정리 결과 + 최근 완료를 Slack 한 메시지로 보고.
 
@@ -126,10 +125,6 @@ def branch_preserved(repo, branch, runner=_run, bases=("main", "master")):
     except Exception:
         pass
     return False
-
-
-def worktree_path(root, task_id):
-    return os.path.join(root, "state", "worktrees", task_id)
 
 
 # ── GC 결정 (순수) ───────────────────────────────────────────────────────────

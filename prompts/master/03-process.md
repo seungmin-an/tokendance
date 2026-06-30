@@ -13,10 +13,10 @@
     - 어느 일감인지 **애매하면 새로 만들지 말고** Slack 으로 "이거 어느 작업 얘기냐"고 되묻는다.
   - **② 특정 일감과 무관한 질문·대화** → 워커 없이 직접 답: `python3 scripts/slack.py post "…"`.
   - **③ 빠르고 안전·격리 불필요**(예: /tmp 메모) → 직접 처리.
-  - **④ 명백히 새 요청일 때만** 본격 코딩 일감으로: `tasks.py new <id> [--repo <레포경로>]` + `task.md` 에 명세·완료기준(디스패치는 cycle.py 가). 타겟이 tokendance 가 아니면 `--repo` 로 그 레포 경로 — 워커는 어느 레포든 격리 worktree(`state/worktrees/<id>`)에서 동작.
+  - **④ 명백히 새 요청일 때만** 본격 코딩 일감으로: `tasks.py new <id> [--repo <레포경로>]` + `task.md` 에 명세·완료기준(디스패치는 cycle.py 가). 타겟이 tokendance 가 아니면 `--repo` 로 그 레포 경로 — 워커는 어느 레포든 warm pool 에서 임대한 격리 worktree(`state/pool/<repo-key>/<n>`)에서 동작.
 - **리뷰**: `task.md` 완료기준 대비 워커 결과(브랜치/diff, 있으면 `checks.md`)를 보고 `review.md` 에 평을 쓴 뒤 —
   합격이면 `status.py set <id> --state done`(원하면 PR), 미흡하면 `steer.md` 에 보완점을 적고 `status.py set <id> --state queued --bump-attempts`.
-  종료(done/failed) 후 worktree 회수(타겟 레포 무관, `<repo>`=status.json 의 repo): `git -C <repo> worktree remove --force state/worktrees/<id>` → `git -C <repo> worktree prune`, 머지/검토 후 `git -C <repo> branch -D tokendance/<id>`.
+  종료(done/failed) 직후 — **done/failed 로 상태를 바꾼 직후 바로** — `bash scripts/reclaim-worktree.sh <id>` 를 실행해 풀 슬롯을 warm pool 에 반환한다(타겟 레포 무관). 머지/검토 후 `git -C <repo> branch -D tokendance/<id>` 로 브랜치만 별도 정리.
   재큐된 일감은 `cycle.py` 가 `--resume` 으로 디스패치하므로 워커가 **직전 세션 컨텍스트를 이어받아** `steer.md` 의 보완점만 반영한다(처음부터 다시 안 함) — 그러니 보완점을 `steer.md` 에 분명히 적어두는 게 중요하다.
 - **재투입(resume)**: heartbeat 가 멈춘(stale) 워커는 supervisor 가 자동 처리한다 — 세션이 있고 프로세스가 죽었으면 `--resume` 으로 bounded 재투입(컨텍스트 보존), 살아있는 hung 이거나 재시도 한도 초과면 `needs_human`. needs_human 으로 올라온 워커를 수동 재투입하려면 `bash scripts/launch-worker.sh <id> --resume`(기존 프로세스 생존확인·세션 만료 시 fresh 폴백 내장).
 - **위임 기준**: 레포 코드 변경·여러 단계·장시간·위험은 워커에게. 빠르고 안전한 건 직접.

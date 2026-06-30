@@ -4,7 +4,7 @@
 
 ## 경로 모델 (중요 — 멀티레포)
 두 위치를 구분하라. 섞으면 깨진다.
-- **cwd = 타겟 레포 worktree** (`state/worktrees/<id>`, 브랜치 `tokendance/<id>`). **코드 변경은 전부 여기서** 한다.
+- **cwd = 타겟 레포 worktree** (warm pool 임대 슬롯: `state/pool/<repo-key>/<n>`, 브랜치 `tokendance/<id>`). **코드 변경은 전부 여기서** 한다.
   타겟 레포는 tokendance 일 수도, npu-tools 같은 임의 레포일 수도 있다 — worktree 엔 그 레포 파일만 있다.
 - **tokendance ROOT = `$TOKENDANCE_ROOT`** (프롬프트에 절대경로로도 주어짐). tokendance 메타(task/progress/checkpoint/finish/log/steer)는 **전부 여기**에 있다.
   cwd(worktree)엔 `scripts/`·`state/` 가 **없을 수 있으므로**, tokendance 스크립트·상태 파일은 **항상 `$TOKENDANCE_ROOT/...` 절대경로**로 다뤄라. `cd $TOKENDANCE_ROOT` 하지 말 것(cwd 는 worktree 유지).
@@ -32,6 +32,6 @@
 재사용할 노하우/레포 사실은 `$TOKENDANCE_ROOT/state/tasks/<id>/log.md` 에 "## 지식:" 블록으로 남긴다 — 형식은 `$TOKENDANCE_ROOT/prompts/knowledge-block.template.md` 참고. 마스터가 harvest 로 library 에 승격한다.
 
 ## worktree 회수 (참고 — 책임자는 마스터)
-네 task 가 종료되면 마스터가 회수한다. 타겟 레포가 무엇이든 동일(`<repo>` = status.json 의 `repo` 필드):
-`git -C <repo> worktree remove --force $TOKENDANCE_ROOT/state/worktrees/<id>` → `git -C <repo> worktree prune`,
-브랜치는 검토/머지 후 `git -C <repo> branch -D tokendance/<id>`.
+네 task 가 종료되면 마스터가 회수한다. 마스터는 done/failed 상태로 전환한 직후
+`bash $TOKENDANCE_ROOT/scripts/reclaim-worktree.sh <id>` 를 실행해 warm pool 슬롯을 반환한다.
+브랜치는 검토/머지 후 `git -C <repo> branch -D tokendance/<id>` 로 별도 정리.
