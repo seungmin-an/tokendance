@@ -181,9 +181,12 @@ class MorningDoneTest(unittest.TestCase):
 
     def test_gc_reclaims_done_worktree_in_new_location(self):
         TK.create_task(self.root, "t1")
-        S.update(self.root, "t1", {"state": "done"})
-        wt = os.path.join(self.root, "state", "worktrees", "t1")
+        # prepare-worktree writes worktree.path into the ACTIVE task dir at dispatch
+        wt = os.path.join(self.root, "state", "pool", "repo", "1")
         os.makedirs(wt)
+        with open(os.path.join(_tasks(self.root), "t1", "worktree.path"), "w") as f:
+            f.write(wt)
+        S.update(self.root, "t1", {"state": "done"})  # relocates task dir (+worktree.path) to tasks-done/
         calls = []
 
         def runner(cmd):
@@ -194,7 +197,7 @@ class MorningDoneTest(unittest.TestCase):
         res = M.run_morning(self.root, post=False, runner=runner)
         actions = {a["task"]: a for a in res["gc"]}
         self.assertIn("t1", actions)
-        self.assertNotEqual(actions["t1"]["action"], "skip")  # done 인식됨(회수 시도)
+        self.assertNotEqual(actions["t1"]["action"], "skip")  # slot_path resolves via tasks-done/
 
     def test_morning_never_archives_done(self):
         TK.create_task(self.root, "t1")

@@ -191,11 +191,12 @@ def gc_decision(task, facts, *, current_task_id=None,
 # ── 사실 수집 + 실행 (IO) ────────────────────────────────────────────────────
 
 def slot_path(root, task_id):
-    """현재 task 의 풀 슬롯 경로(state/tasks/<id>/worktree.path 에서 읽음).
+    """현재 task 의 풀 슬롯 경로(<task_dir>/worktree.path 에서 읽음).
 
-    파일이 없으면 빈 문자열을 반환(슬롯 미할당 / 이미 반환).
+    done task 는 state/tasks-done/<id>/ 로 이동하므로 resolver(S.task_dir)로
+    양쪽 base 를 조회한다. 파일이 없으면 빈 문자열(슬롯 미할당 / 이미 반환).
     """
-    p = os.path.join(root, "state", "tasks", task_id, "worktree.path")
+    p = os.path.join(S.task_dir(root, task_id), "worktree.path")
     try:
         with open(p) as f:
             return f.read().strip()
