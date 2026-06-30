@@ -2,6 +2,7 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -162,6 +163,33 @@ class AcquireReleaseTest(unittest.TestCase):
         pool.release(self.repo, p1, root=self.tmp)
         p2 = pool.acquire(self.repo, "task-2", root=self.tmp)
         self.assertTrue(os.path.exists(os.path.join(p2, "target", "warm.bin")))
+
+
+class CliTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.repo = _init_repo(os.path.join(self.tmp, "repo"))
+        self.script = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                   "scripts", "pool.py")
+
+    def _run(self, *args):
+        return subprocess.run([sys.executable, self.script, "--root", self.tmp, *args],
+                              capture_output=True, text=True)
+
+    def test_cli_acquire_prints_path_and_status_lists_it(self):
+        r = self._run("acquire", "--repo", self.repo, "--holder", "task-1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        path = r.stdout.strip().splitlines()[-1]
+        self.assertTrue(os.path.isdir(path))
+        s = self._run("status", "--repo", self.repo)
+        self.assertIn("task-1", s.stdout)
+        self.assertIn("leased", s.stdout)
+
+    def test_cli_release_frees_slot(self):
+        p = self._run("acquire", "--repo", self.repo, "--holder", "task-1").stdout.strip().splitlines()[-1]
+        self._run("release", "--repo", self.repo, "--path", p)
+        s = self._run("status", "--repo", self.repo)
+        self.assertIn("idle", s.stdout)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 """Warm worktree pool: lease/reuse git worktrees so parallel workers keep warm
 build caches (per-slot target/) without re-paying full builds. Ported from
 treehouse's lease-pool model; stdlib-only. State is flock-serialized JSON."""
+import argparse
 import contextlib
 import fcntl
 import hashlib
@@ -172,3 +173,37 @@ def release(repo, path, root=None):
                 e["lease_holder"] = ""
                 break
         save_state(pdir, state)
+
+
+def status(repo, root=None):
+    pdir = pool_dir(os.path.abspath(repo), root)
+    with state_lock(pdir):
+        state = load_state(pdir)
+        _heal(state)
+        save_state(pdir, state)
+    rows = []
+    for e in state["entries"]:
+        rows.append((e["name"], "leased" if e["leased"] else "idle",
+                     e.get("lease_holder", ""), e["path"]))
+    return rows
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--root", default=None)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    a = sub.add_parser("acquire"); a.add_argument("--repo", required=True); a.add_argument("--holder", required=True)
+    rl = sub.add_parser("release"); rl.add_argument("--repo", required=True); rl.add_argument("--path", required=True)
+    st = sub.add_parser("status"); st.add_argument("--repo", required=True)
+    args = ap.parse_args(argv)
+    if args.cmd == "acquire":
+        print(acquire(args.repo, args.holder, root=args.root))
+    elif args.cmd == "release":
+        release(args.repo, args.path, root=args.root)
+    elif args.cmd == "status":
+        for name, state_, holder, path in status(args.repo, root=args.root):
+            print(f"{name}\t{state_}\t{holder}\t{path}")
+
+
+if __name__ == "__main__":
+    main()
