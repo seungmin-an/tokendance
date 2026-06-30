@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import subprocess
+import time
 
 try:
     from scripts import config
@@ -108,3 +109,66 @@ def apply_shared_symlinks(repo, wt, root=None):
             continue  # real tracked content — leave it
         os.makedirs(os.path.dirname(dst) or wt, exist_ok=True)
         os.symlink(src, dst)
+
+
+def max_trees(root=None):
+    return config.get_int("POOL_MAX_TREES", r=root)
+
+
+def _heal(state):
+    state["entries"] = [e for e in state["entries"] if os.path.isdir(e["path"])]
+
+
+def _next_name(state):
+    used = {e["name"] for e in state["entries"]}
+    i = 1
+    while str(i) in used:
+        i += 1
+    return str(i)
+
+
+def acquire(repo, holder, root=None):
+    repo = os.path.abspath(repo)
+    pdir = pool_dir(repo, root)
+    branch = f"tokendance/{holder}"
+    with state_lock(pdir):
+        state = load_state(pdir)
+        _heal(state)
+        git(repo, "fetch", "origin", check=False)
+        ref = default_ref(repo)
+        slot = next((e for e in state["entries"]
+                     if not e["leased"] and os.path.isdir(e["path"])
+                     and not is_dirty(e["path"])), None)
+        if slot is None:
+            if len(state["entries"]) >= max_trees(root):
+                raise RuntimeError(
+                    f"pool full ({max_trees(root)} slots); no idle slot for {holder}")
+            name = _next_name(state)
+            path = os.path.join(pdir, name)
+            add_worktree(repo, path, ref)
+            slot = {"name": name, "path": path, "created_at": int(time.time()),
+                    "leased": False, "lease_holder": ""}
+            state["entries"].append(slot)
+        reset_worktree(slot["path"], ref)
+        git(slot["path"], "checkout", "-B", branch, ref)
+        slot["leased"] = True
+        slot["lease_holder"] = holder
+        save_state(pdir, state)
+        apply_shared_symlinks(repo, slot["path"], root)
+        return slot["path"]
+
+
+def release(repo, path, root=None):
+    repo = os.path.abspath(repo)
+    pdir = pool_dir(repo, root)
+    with state_lock(pdir):
+        state = load_state(pdir)
+        ref = default_ref(repo)
+        for e in state["entries"]:
+            if os.path.abspath(e["path"]) == os.path.abspath(path):
+                if os.path.isdir(e["path"]):
+                    reset_worktree(e["path"], ref)
+                e["leased"] = False
+                e["lease_holder"] = ""
+                break
+        save_state(pdir, state)

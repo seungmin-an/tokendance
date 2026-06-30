@@ -114,5 +114,55 @@ class SymlinkTest(unittest.TestCase):
                          os.path.realpath(os.path.join(self.repo, ".venv")))
 
 
+def _branch(wt):
+    return subprocess.run(["git", "-C", wt, "rev-parse", "--abbrev-ref", "HEAD"],
+                          capture_output=True, text=True).stdout.strip()
+
+
+class AcquireReleaseTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.repo = _init_repo(os.path.join(self.tmp, "repo"))
+
+    def test_acquire_creates_slot_on_task_branch(self):
+        path = pool.acquire(self.repo, "task-1", root=self.tmp)
+        self.assertTrue(os.path.isdir(path))
+        self.assertEqual(_branch(path), "tokendance/task-1")
+        st = pool.load_state(pool.pool_dir(self.repo, self.tmp))
+        self.assertTrue(st["entries"][0]["leased"])
+        self.assertEqual(st["entries"][0]["lease_holder"], "task-1")
+
+    def test_release_then_reacquire_reuses_same_slot(self):
+        p1 = pool.acquire(self.repo, "task-1", root=self.tmp)
+        pool.release(self.repo, p1, root=self.tmp)
+        p2 = pool.acquire(self.repo, "task-2", root=self.tmp)
+        self.assertEqual(p1, p2)  # warm reuse
+        self.assertEqual(_branch(p2), "tokendance/task-2")
+        st = pool.load_state(pool.pool_dir(self.repo, self.tmp))
+        self.assertEqual(len(st["entries"]), 1)
+
+    def test_parallel_leases_get_distinct_slots(self):
+        p1 = pool.acquire(self.repo, "task-1", root=self.tmp)
+        p2 = pool.acquire(self.repo, "task-2", root=self.tmp)
+        self.assertNotEqual(p1, p2)
+
+    def test_pool_full_raises(self):
+        # cap the pool at 1 via config.local.md
+        with open(os.path.join(self.tmp, "config.local.md"), "w") as f:
+            f.write("POOL_MAX_TREES=1\n")
+        pool.acquire(self.repo, "task-1", root=self.tmp)
+        with self.assertRaises(RuntimeError):
+            pool.acquire(self.repo, "task-2", root=self.tmp)
+
+    def test_warm_target_survives_release(self):
+        p1 = pool.acquire(self.repo, "task-1", root=self.tmp)
+        os.makedirs(os.path.join(p1, "target"))
+        with open(os.path.join(p1, "target", "warm.bin"), "w") as f:
+            f.write("cache")
+        pool.release(self.repo, p1, root=self.tmp)
+        p2 = pool.acquire(self.repo, "task-2", root=self.tmp)
+        self.assertTrue(os.path.exists(os.path.join(p2, "target", "warm.bin")))
+
+
 if __name__ == "__main__":
     unittest.main()
