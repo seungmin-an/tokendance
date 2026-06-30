@@ -431,7 +431,7 @@ def _repos_with_pools(root):
             try:
                 r = subprocess.run(
                     ["git", "-C", slot, "worktree", "list", "--porcelain"],
-                    capture_output=True, text=True)
+                    capture_output=True, text=True, timeout=10)
                 if r.returncode != 0:
                     continue
                 for line in r.stdout.splitlines():

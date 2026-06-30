@@ -24,7 +24,7 @@ DEFAULTS = {
     "POOL_TARGET_LOWWATER_GB": "0",     # evict down to this (GB); 0 = derive 0.8 * max
     "POOL_TARGET_IDLE_DAYS": "14",      # idle-sweep: evict idle slot target/ untouched ≥ this many days; 0 = off
     "POOL_TARGET_USE_CARGO_SWEEP": "0", # 1 = use `cargo sweep` for idle sweep when available
-    "POOL_LEASE_TTL_HOURS": "48",  # reclaim a leased slot whose holder is gone or heartbeat older than this; 0 = off
+    "POOL_LEASE_TTL_HOURS": "48",  # reclaim a leased slot whose holder is gone or heartbeat older than this; 0 = off (consumed by morning.live_holders)
 }
 
 

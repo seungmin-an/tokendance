@@ -16,8 +16,10 @@ def _init_repo(path):
     run = lambda *a: subprocess.run(["git", "-C", path, *a], check=True,
                                     capture_output=True, text=True, env=env)
     run("init", "-q", "-b", "main")
-    open(os.path.join(path, "README"), "w").write("hi\n")
-    open(os.path.join(path, ".gitignore"), "w").write("target/\n.venv\n")
+    with open(os.path.join(path, "README"), "w") as f:
+        f.write("hi\n")
+    with open(os.path.join(path, ".gitignore"), "w") as f:
+        f.write("target/\n.venv\n")
     run("add", "-A"); run("commit", "-q", "-m", "init")
     return path
 
@@ -128,7 +130,7 @@ class ReclaimStaleTest(unittest.TestCase):
         pool.acquire(self.repo, "live", root=self.tmp)
         pool.acquire(self.repo, "dead", root=self.tmp)
         reclaimed = pool.reclaim_stale(self.repo, root=self.tmp, keep_holders={"live"})
-        self.assertEqual(reclaimed, ["dead"])
+        self.assertEqual(set(reclaimed), {"dead"})
         self.assertEqual(self._leased(), {"live"})
 
     def test_keep_all_reclaims_nothing(self):
@@ -137,3 +139,14 @@ class ReclaimStaleTest(unittest.TestCase):
         self.assertEqual(pool.reclaim_stale(self.repo, root=self.tmp,
                                             keep_holders={"a", "b"}), [])
         self.assertEqual(self._leased(), {"a", "b"})
+
+    def test_expected_holder_mismatch_leaves_slot_leased(self):
+        """TOCTOU guard: release with wrong expected_holder must NOT clear the lease."""
+        path = pool.acquire(self.repo, "x", root=self.tmp)
+        # Simulate a stale snapshot: caller thinks holder was "someone-else", but slot
+        # is actually held by "x". release must skip (not clear).
+        pool.release(self.repo, path, self.tmp, expected_holder="someone-else")
+        self.assertEqual(self._leased(), {"x"})  # still leased to "x"
+        # Correct expected_holder clears it normally.
+        pool.release(self.repo, path, self.tmp, expected_holder="x")
+        self.assertEqual(self._leased(), set())  # now released

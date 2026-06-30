@@ -187,7 +187,7 @@ def acquire(repo, holder, root=None):
         return slot["path"]
 
 
-def release(repo, path, root=None):
+def release(repo, path, root=None, *, expected_holder=None):
     repo = os.path.abspath(repo)
     pdir = pool_dir(repo, root)
     with state_lock(pdir):
@@ -195,6 +195,8 @@ def release(repo, path, root=None):
         ref = default_ref(repo)
         for e in state["entries"]:
             if os.path.abspath(e["path"]) == os.path.abspath(path):
+                if expected_holder is not None and e.get("lease_holder", "") != expected_holder:
+                    return  # stale snapshot: slot re-acquired by someone else; leave it
                 if os.path.isdir(e["path"]):
                     reset_worktree(e["path"], ref)
                 e["leased"] = False
@@ -218,7 +220,7 @@ def reclaim_stale(repo, root=None, *, keep_holders):
                  if e["leased"] and e.get("lease_holder", "") not in keep_holders]
     reclaimed = []
     for e in stale:
-        release(repo, e["path"], root)   # release takes its own lock; reset + clear lease
+        release(repo, e["path"], root, expected_holder=e["lease_holder"])   # release takes its own lock; TOCTOU-safe
         reclaimed.append(e["lease_holder"])
     return reclaimed
 
@@ -293,7 +295,7 @@ def gc_targets(repo, root=None, *, now=None, dry_run=False):
     with state_lock(pdir):
         state = load_state(pdir)
         _heal(repo, pdir, state)
-        # idle (unleased) slots with an existing target/, newest-first by mtime
+        # idle (unleased) slots with an existing target/, in state order
         cand = []
         for e in state["entries"]:
             if e["leased"]:
