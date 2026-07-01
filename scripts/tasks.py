@@ -16,7 +16,7 @@ _SCAFFOLD = {
     "progress.md": "",
     "steer.md": "",
     "steer.cursor": "0",
-    "log.md": "",
+    "knowledge.md": "",
     "review.md": "",
 }
 

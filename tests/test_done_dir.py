@@ -164,7 +164,7 @@ class HarvestAcrossBasesTest(unittest.TestCase):
 
     def test_harvest_iterates_done_logs(self):
         TK.create_task(self.root, "t1")
-        with open(os.path.join(_tasks(self.root), "t1", "log.md"), "w") as f:
+        with open(os.path.join(_tasks(self.root), "t1", "knowledge.md"), "w") as f:
             f.write("hello")
         S.update(self.root, "t1", {"state": "done"})    # → tasks-done/
         seen = {tid for tid, repo, text in HK._iter_task_logs(self.root)}

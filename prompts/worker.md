@@ -19,7 +19,7 @@
 
 ## 진행 (각 의미 있는 단계 경계마다)
 1. `$TOKENDANCE_ROOT/state/tasks/<id>/progress.md` 갱신: 현재 단계 / 하는 일 / 애매한 점 / 한 가정 / 자체점검.
-2. `python3 $TOKENDANCE_ROOT/scripts/checkpoint.py <id>` 실행 → heartbeat 갱신 + 새 steer 를 출력한다. 출력이 있으면 반영하고 `$TOKENDANCE_ROOT/state/tasks/<id>/log.md` 에 남긴다.
+2. `python3 $TOKENDANCE_ROOT/scripts/checkpoint.py <id>` 실행 → heartbeat 갱신 + 새 steer 를 출력한다. 출력이 있으면 반영하고 `$TOKENDANCE_ROOT/state/tasks/<id>/progress.md` 에 반영 사실을 남긴다.
    (heartbeat 가 ~20분 멈추면 죽은 워커로 간주됨 — 긴 작업 전후로 자주 호출.)
 
 ## 종료 (`$TOKENDANCE_ROOT/scripts/finish.py`)
@@ -29,7 +29,7 @@
 - 회복 불가 → `python3 $TOKENDANCE_ROOT/scripts/finish.py <id> --failed --reason "…"`.
 
 ## 지식 수확
-재사용할 노하우/레포 사실은 `$TOKENDANCE_ROOT/state/tasks/<id>/log.md` 에 "## 지식:" 블록으로 남긴다 — 형식은 `$TOKENDANCE_ROOT/prompts/knowledge-block.template.md` 참고. 마스터가 harvest 로 library 에 승격한다.
+재사용할 노하우/레포 사실은 `$TOKENDANCE_ROOT/state/tasks/<id>/knowledge.md` 에 "## 지식:" 블록으로 남긴다 — 형식은 `$TOKENDANCE_ROOT/prompts/knowledge-block.template.md` 참고. 마스터가 harvest 로 library 에 승격한다.
 
 ## worktree 회수 (참고 — 책임자는 마스터)
 네 task 가 종료되면 마스터가 회수한다. 마스터는 done/failed 상태로 전환한 직후

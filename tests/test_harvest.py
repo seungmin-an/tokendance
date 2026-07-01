@@ -7,7 +7,7 @@ import status as S
 def _make_task(root, tid, log, repo=""):
     S.init(root, tid, title=tid, repo=repo)
     td = os.path.join(root, "state", "tasks", tid)
-    with open(os.path.join(td, "log.md"), "w") as f:
+    with open(os.path.join(td, "knowledge.md"), "w") as f:
         f.write(log)
     return td
 
@@ -137,7 +137,7 @@ class HarvestTest(unittest.TestCase):
     def test_changed_body_updates_entry(self):
         td = _make_task(self.root, "t1", "## 지식: 진화\n\n옛 본문.\n")
         HK.harvest(self.root)
-        with open(os.path.join(td, "log.md"), "w") as f:
+        with open(os.path.join(td, "knowledge.md"), "w") as f:
             f.write("## 지식: 진화\n\n새 본문 v2.\n")
         summary = HK.harvest(self.root)
         self.assertEqual(summary["updated"], ["playbook:진화"])

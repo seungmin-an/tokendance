@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""워커 log.md 의 "## 지식:" 블록을 수확해 library 로 승격한다.
+"""워커 knowledge.md 의 "## 지식:" 블록을 수확해 library 로 승격한다.
 
 진실의 원천은 ledger(`library/.harvest-ledger.json`). library 파일들
 (playbooks/<slug>.md, repos/<repo>.md, index.md)은 ledger 의 순수 투영으로
-매 실행 재렌더되므로 멱등하다. log.md 는 읽기만 하고 건드리지 않는다(파일 소유 규약).
+매 실행 재렌더되므로 멱등하다. knowledge.md 는 읽기만 하고 건드리지 않는다(파일 소유 규약).
 
 블록 형식 (worker.md 와 일치):
     ## 지식: <제목>
@@ -38,7 +38,7 @@ _META_RE = re.compile(r"^([A-Za-z_]+):\s*(.*?)\s*$")
 
 
 def parse_knowledge_blocks(text):
-    """log.md 텍스트에서 지식 블록 목록을 추출한다."""
+    """knowledge.md 텍스트에서 지식 블록 목록을 추출한다."""
     lines = text.splitlines()
     blocks = []
     i = 0
@@ -186,8 +186,8 @@ def save_ledger(root, ledger):
 # --- 수확 -------------------------------------------------------------------
 
 def _iter_task_logs(root):
-    # active(tasks/) + done(tasks-done/) 양쪽의 log.md 를 수확한다. done 은 전용 디렉토리로
-    # 분리되므로 여기서도 양쪽을 봐야 완료 task 의 지식을 놓치지 않는다.
+    # active(tasks/) + done(tasks-done/) 양쪽의 knowledge.md 를 수확한다. done 은 전용
+    # 디렉토리로 분리되므로 여기서도 양쪽을 봐야 완료 task 의 지식을 놓치지 않는다.
     seen = set()
     for base_name in ("tasks", "tasks-done"):
         base = os.path.join(root, "state", base_name)
@@ -196,7 +196,7 @@ def _iter_task_logs(root):
         for tid in sorted(os.listdir(base)):
             if tid in seen:
                 continue
-            log = os.path.join(base, tid, "log.md")
+            log = os.path.join(base, tid, "knowledge.md")
             status = os.path.join(base, tid, "status.json")
             if not (os.path.exists(log) and os.path.exists(status)):
                 continue
@@ -233,7 +233,7 @@ def _build_entry(block, scope, repo, slug):
 
 
 def harvest(root):
-    """모든 워커 log.md 를 스캔해 ledger 를 갱신하고 library 를 재렌더한다.
+    """모든 워커 knowledge.md 를 스캔해 ledger 를 갱신하고 library 를 재렌더한다.
 
     librarian(사서)과 같은 flock 으로 직렬화한다 — 사서가 ledger 를 편집/재렌더하는
     중간에 harvest 가 끼어들어 서로의 변경을 덮어쓰지 않게.
@@ -408,7 +408,7 @@ def _default_root():
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="워커 log.md 의 '## 지식:' 블록을 library 로 승격(멱등).")
+        description="워커 knowledge.md 의 '## 지식:' 블록을 library 로 승격(멱등).")
     ap.add_argument("--root", default=_default_root())
     args = ap.parse_args(argv)
     s = harvest(args.root)

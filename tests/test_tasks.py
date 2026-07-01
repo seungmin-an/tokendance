@@ -15,7 +15,7 @@ class TasksTest(unittest.TestCase):
     def test_create_scaffolds_files(self):
         td = TK.create_task(self.root, "t1", title="제목", repo="r")
         for name in ("status.json", "task.md", "progress.md",
-                     "steer.md", "steer.cursor", "log.md", "review.md"):
+                     "steer.md", "steer.cursor", "knowledge.md", "review.md"):
             self.assertTrue(os.path.exists(os.path.join(td, name)), name)
         with open(os.path.join(td, "steer.cursor")) as f:
             self.assertEqual(f.read().strip(), "0")
