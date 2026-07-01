@@ -39,3 +39,22 @@ class RecallTest(unittest.TestCase):
     def test_repo_match_is_by_basename(self):
         self._seed(_entry("foo fact", "repo", "/abs/path/foo", "foo-fact"))
         self.assertIn("foo fact", HK.recall_block(self.tmp, "/root/foo"))  # basename foo == foo
+
+    def test_caps_entries_and_prioritizes_repo_over_playbook(self):
+        with open(os.path.join(self.tmp, "config.local.md"), "w") as f:
+            f.write("RECALL_MAX_ENTRIES=2\n")
+        self._seed(
+            _entry("foo fact 1", "repo", "foo", "foo-fact-1"),
+            _entry("foo fact 2", "repo", "foo", "foo-fact-2"),
+            _entry("foo fact 3", "repo", "foo", "foo-fact-3"),
+            _entry("pb one", "playbook", None, "pb-one"),
+        )
+        out = HK.recall_block(self.tmp, "/some/path/foo")
+        entry_lines = [ln for ln in out.splitlines() if ln.startswith("- ")]
+        self.assertLessEqual(len(entry_lines), 2)          # capped at RECALL_MAX_ENTRIES
+        self.assertIn("foo fact 1", out)                   # repo-scoped kept preferentially
+        self.assertIn("foo fact 2", out)
+        self.assertNotIn("foo fact 3", out)                # excess repo entry dropped
+        self.assertNotIn("pb one", out)                     # playbook dropped entirely (cap exhausted by repo)
+        self.assertIn("더", out)                            # truncation note present
+        self.assertIn("(+2개 더", out)                      # 1 dropped repo entry + 1 dropped playbook

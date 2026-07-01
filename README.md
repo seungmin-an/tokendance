@@ -95,7 +95,7 @@ python3 scripts/tasks.py archive <id>         # 종료(done/failed) task 를 sta
 ### 파일 레이아웃
 ```
 state/inbox/{pending,processed}/   입력 큐
-state/tasks/<id>/                  task.md · status.json · progress.md · steer.md · log.md · review.md
+state/tasks/<id>/                  task.md · status.json · progress.md · steer.md · knowledge.md(지식 블록, harvest 대상) · review.md
 state/reports/<날짜>.md             일자 리포트
 state/worktrees/<id>/              워커 격리 작업트리
 prompts/master/*.md                마스터 시스템 프롬프트(관심사별 분할: persona/tools/process/rules)
