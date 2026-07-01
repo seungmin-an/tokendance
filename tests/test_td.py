@@ -277,3 +277,26 @@ class WorktreeLsTest(unittest.TestCase):
         self.assertIn("t1", by_holder)
         self.assertEqual(by_holder["t1"]["state"], "leased")
         self.assertGreaterEqual(by_holder["t1"]["target_bytes"], 4096)
+
+
+class HelpTest(unittest.TestCase):
+    def _run(self, argv):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            td.main(argv)          # must NOT raise SystemExit
+        return buf.getvalue()
+
+    def test_bare_td_prints_help_without_error(self):
+        out = self._run([])
+        self.assertIn("status", out)
+        self.assertIn("spawn", out)
+
+    def test_help_lists_subcommands(self):
+        out = self._run(["help"])
+        for c in ("status", "peek", "steer", "spawn", "worktree"):
+            self.assertIn(c, out)
+
+    def test_help_topic_shows_command_detail(self):
+        out = self._run(["help", "spawn"])
+        self.assertIn("--repo", out)
