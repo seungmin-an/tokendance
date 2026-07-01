@@ -289,24 +289,33 @@ class HelpTest(unittest.TestCase):
 
     def test_bare_td_prints_help_without_error(self):
         out = self._run([])
-        self.assertIn("status", out)
+        self.assertIn("task", out)
         self.assertIn("spawn", out)
 
     def test_help_lists_subcommands(self):
         out = self._run(["help"])
-        for c in ("status", "peek", "steer", "spawn", "worktree"):
+        for c in ("task", "peek", "steer", "spawn", "worktree"):
             self.assertIn(c, out)
 
     def test_help_topic_shows_command_detail(self):
-        out = self._run(["help", "spawn"])
-        self.assertIn("--repo", out)
+        out = self._run(["help", "task"])
+        self.assertIn("spawn", out)
 
     def test_top_level_help_has_no_standalone_disk_or_gc(self):
         out = self._run(["help"])
         self.assertIn("worktree", out)
-        top_level_cmds = re.findall(r"^  (\S+)", out, re.MULTILINE)
+        # top-level groups are exactly task/worktree/help; disk/gc/status/peek
+        # are no longer top-level commands, but DO appear nested under their
+        # group's expanded help.
+        top_section = out.split("\n\n", 1)[0]
+        top_level_cmds = re.findall(r"^  (\S+)", top_section, re.MULTILINE)
         self.assertNotIn("disk", top_level_cmds)
         self.assertNotIn("gc", top_level_cmds)
+        self.assertNotIn("status", top_level_cmds)
+        self.assertNotIn("peek", top_level_cmds)
+        self.assertIn("disk", out)
+        self.assertIn("gc", out)
+        self.assertIn("peek", out)
 
 
 class WorktreeDispatchTest(unittest.TestCase):
@@ -338,3 +347,42 @@ class WorktreeDispatchTest(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             td.main(["disk"])
         self.assertEqual(ctx.exception.code, 2)
+
+
+class TaskNamespaceTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.repo = _init_repo(os.path.join(self.tmp, "repo"))
+        TK.create_task(self.tmp, "t1", repo=self.repo)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, argv):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            td.main(["--root", self.tmp, *argv])  # must NOT raise
+        return buf.getvalue()
+
+    def test_task_ls_lists_tasks(self):
+        out = self._run(["task", "ls"])
+        self.assertIn("t1", out)
+
+    def test_task_spawn_creates_queued_task(self):
+        out = self._run(["task", "spawn", "--repo", self.repo, "desc"])
+        self.assertTrue(out.strip())
+
+    def test_top_level_status_is_no_longer_a_valid_command(self):
+        with self.assertRaises(SystemExit) as ctx:
+            td.main(["status"])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_help_shows_nested_actions(self):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            td.main(["help"])
+        out = buf.getvalue()
+        for c in ("task", "worktree", "peek", "steer", "spawn", "disk", "gc"):
+            self.assertIn(c, out)

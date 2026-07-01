@@ -222,25 +222,35 @@ def cmd_gc(root, repo=None, dry_run=False):
     return acts
 
 
+def _print_full_help(ap, sub):
+    ap.print_help()
+    for name in ("task", "worktree"):
+        if name in sub.choices:
+            print()
+            sub.choices[name].print_help()
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="td", description="tokendance interactive control")
     ap.add_argument("--root", default=None)
     sub = ap.add_subparsers(dest="cmd", required=False)
-    sub.add_parser("status", help="list all tasks (state, heartbeat age, attempts)")
-    pk = sub.add_parser("peek", help="show a task's progress, pending steer, and recent log")
+    task_p = sub.add_parser("task", help="inspect and control tasks (ls, peek, steer, spawn, …)")
+    task_sub = task_p.add_subparsers(dest="task_cmd", required=True)
+    task_sub.add_parser("ls", help="list all tasks (state, heartbeat age, attempts)")
+    pk = task_sub.add_parser("peek", help="show a task's progress, pending steer, and recent log")
     pk.add_argument("task_id"); pk.add_argument("-n", type=int, default=20)
-    lg = sub.add_parser("logs", help="print or follow (-f) a worker's log")
+    lg = task_sub.add_parser("logs", help="print or follow (-f) a worker's log")
     lg.add_argument("task_id"); lg.add_argument("-f", action="store_true")
-    sr = sub.add_parser("steer", help="append guidance a running worker reads at its next checkpoint")
+    sr = task_sub.add_parser("steer", help="append guidance a running worker reads at its next checkpoint")
     sr.add_argument("task_id"); sr.add_argument("msg")
-    pa = sub.add_parser("pause", help="pause dispatch of a task"); pa.add_argument("task_id")
-    re_ = sub.add_parser("resume", help="resume a paused task"); re_.add_argument("task_id")
-    rd = sub.add_parser("redirect", help="steer + kill + relaunch a worker with --resume")
+    pa = task_sub.add_parser("pause", help="pause dispatch of a task"); pa.add_argument("task_id")
+    re_ = task_sub.add_parser("resume", help="resume a paused task"); re_.add_argument("task_id")
+    rd = task_sub.add_parser("redirect", help="steer + kill + relaunch a worker with --resume")
     rd.add_argument("task_id"); rd.add_argument("msg")
-    ab = sub.add_parser("abort", help="kill a worker; requeue (or --fail)")
+    ab = task_sub.add_parser("abort", help="kill a worker; requeue (or --fail)")
     ab.add_argument("task_id")
     ab.add_argument("--fail", action="store_true", help="mark failed instead of requeue")
-    sp = sub.add_parser("spawn", help="create a queued coding task for a repo")
+    sp = task_sub.add_parser("spawn", help="create a queued coding task for a repo")
     sp.add_argument("--repo", required=True)
     sp.add_argument("desc"); sp.add_argument("--id", default=None)
     wt = sub.add_parser("worktree", help="inspect/manage the warm worktree pool (ls, disk, gc)")
@@ -260,34 +270,35 @@ def main(argv=None):
         if topic and topic in sub.choices:
             sub.choices[topic].print_help()
         else:
-            ap.print_help()
+            _print_full_help(ap, sub)
         return
     root = _root(args.root)
-    if args.cmd == "status":
-        print(f"{'ID':24} {'STATE':12} {'HB':8} {'ATT':4} FLAG")
-        for tid, st, age, att, flag in cmd_status(root):
-            print(f"{tid:24} {st:12} {age:8} {att:4} {flag}")
-    elif args.cmd == "peek":
-        print(cmd_peek(root, args.task_id, log_lines=args.n))
-    elif args.cmd == "logs":
-        cmd_logs(root, args.task_id, follow=args.f)
-    elif args.cmd == "steer":
-        cmd_steer(root, args.task_id, args.msg)
-    elif args.cmd == "pause":
-        cmd_pause(root, args.task_id)
-        if S.read(root, args.task_id).get("state") == "running":
-            print(f"note: {args.task_id} is running; pause takes effect only when it requeues", file=sys.stderr)
-    elif args.cmd == "resume":
-        cmd_resume(root, args.task_id)
-    elif args.cmd == "redirect":
-        cmd_redirect(root, args.task_id, args.msg)
-    elif args.cmd == "abort":
-        cmd_abort(root, args.task_id, mode="fail" if args.fail else "requeue")
-    elif args.cmd == "spawn":
-        try:
-            print(cmd_spawn(root, args.repo, args.desc, task_id=args.id))
-        except ValueError as e:
-            print(f"td spawn: {e}", file=sys.stderr); raise SystemExit(1)
+    if args.cmd == "task":
+        if args.task_cmd == "ls":
+            print(f"{'ID':24} {'STATE':12} {'HB':8} {'ATT':4} FLAG")
+            for tid, st, age, att, flag in cmd_status(root):
+                print(f"{tid:24} {st:12} {age:8} {att:4} {flag}")
+        elif args.task_cmd == "peek":
+            print(cmd_peek(root, args.task_id, log_lines=args.n))
+        elif args.task_cmd == "logs":
+            cmd_logs(root, args.task_id, follow=args.f)
+        elif args.task_cmd == "steer":
+            cmd_steer(root, args.task_id, args.msg)
+        elif args.task_cmd == "pause":
+            cmd_pause(root, args.task_id)
+            if S.read(root, args.task_id).get("state") == "running":
+                print(f"note: {args.task_id} is running; pause takes effect only when it requeues", file=sys.stderr)
+        elif args.task_cmd == "resume":
+            cmd_resume(root, args.task_id)
+        elif args.task_cmd == "redirect":
+            cmd_redirect(root, args.task_id, args.msg)
+        elif args.task_cmd == "abort":
+            cmd_abort(root, args.task_id, mode="fail" if args.fail else "requeue")
+        elif args.task_cmd == "spawn":
+            try:
+                print(cmd_spawn(root, args.repo, args.desc, task_id=args.id))
+            except ValueError as e:
+                print(f"td spawn: {e}", file=sys.stderr); raise SystemExit(1)
     elif args.cmd == "worktree":
         if args.wt_cmd == "ls":
             print(f"{'REPO':20} {'SLOT':5} {'STATE':7} {'HOLDER':25} {'TARGET':>8} PATH")
