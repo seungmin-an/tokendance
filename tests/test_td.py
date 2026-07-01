@@ -252,3 +252,28 @@ class DiskGcTest(unittest.TestCase):
         acts = td.cmd_gc(self.tmp, dry_run=True)
         self.assertTrue(acts)  # reported
         self.assertTrue(os.path.exists(os.path.join(p, "target")))  # not freed
+
+
+class WorktreeLsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.repo = _init_repo(os.path.join(self.tmp, "repo"))
+        TK.create_task(self.tmp, "t1", repo=self.repo)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_ls_shows_slot_holder_state_and_target_size(self):
+        p1 = pool.acquire(self.repo, "t1", root=self.tmp)
+        pool.acquire(self.repo, "t2", root=self.tmp)
+        os.makedirs(os.path.join(p1, "target"), exist_ok=True)
+        with open(os.path.join(p1, "target", "x.bin"), "wb") as f:
+            f.write(b"x" * 4096)
+
+        rows = td.cmd_worktree_ls(self.tmp)
+
+        self.assertEqual(len(rows), 2)
+        by_holder = {r["holder"]: r for r in rows}
+        self.assertIn("t1", by_holder)
+        self.assertEqual(by_holder["t1"]["state"], "leased")
+        self.assertGreaterEqual(by_holder["t1"]["target_bytes"], 4096)

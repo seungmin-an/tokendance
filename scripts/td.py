@@ -201,6 +201,19 @@ def cmd_disk(root, repo=None):
     return result
 
 
+def cmd_worktree_ls(root, repo=None):
+    repos = [os.path.abspath(repo)] if repo else _repos(root)
+    rows = []
+    for r in repos:
+        rep = pool.disk_report(r, root=root)
+        for e in rep["slots"]:
+            rows.append({"repo": r, "name": e["name"],
+                         "state": "leased" if e["leased"] else "idle",
+                         "holder": e["holder"] or "",
+                         "target_bytes": e["target_bytes"], "path": e["path"]})
+    return rows
+
+
 def cmd_gc(root, repo=None, dry_run=False):
     repos = [os.path.abspath(repo)] if repo else _repos(root)
     acts = []
@@ -227,6 +240,9 @@ def main(argv=None):
     dk = sub.add_parser("disk"); dk.add_argument("--repo", default=None)
     gc_ = sub.add_parser("gc"); gc_.add_argument("--repo", default=None)
     gc_.add_argument("--dry-run", action="store_true")
+    wt = sub.add_parser("worktree")
+    wt_sub = wt.add_subparsers(dest="wt_cmd", required=True)
+    wt_ls = wt_sub.add_parser("ls"); wt_ls.add_argument("--repo", default=None)
     args = ap.parse_args(argv)
     root = _root(args.root)
     if args.cmd == "status":
@@ -263,6 +279,12 @@ def main(argv=None):
         for a in acts:
             print(f"{a['name']}\t{a['reason']}\t{a.get('freed_bytes', 0)}")
         print(f"FREED\t{freed}")
+    elif args.cmd == "worktree" and args.wt_cmd == "ls":
+        print(f"{'REPO':20} {'SLOT':5} {'STATE':7} {'HOLDER':25} {'TARGET':>8} PATH")
+        for row in cmd_worktree_ls(root, repo=args.repo):
+            print(f"{os.path.basename(row['repo']):20} {row['name']:5} {row['state']:7} "
+                  f"{row['holder'] or '-':25} {row['target_bytes'] // (1024*1024):>6}M "
+                  f"{row['path']}")
 
 
 if __name__ == "__main__":
