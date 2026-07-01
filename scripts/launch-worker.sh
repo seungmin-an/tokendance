@@ -110,6 +110,13 @@ else
   PROMPT="너는 tokendance 워커다. task id=${TASK_ID}. tokendance ROOT(절대경로)=${ROOT} (환경변수 TOKENDANCE_ROOT 에도 있음). cwd 는 타겟 레포 worktree 다. ${ROOT}/prompts/worker.md 를 읽고 그대로 따르라. 일감 명세: ${TASK_DIR}/task.md"
 fi
 SYSPROMPT="$(python3 "$ROOT/scripts/prompt.py" build worker)"
+# Auto-recall: prepend accumulated library knowledge for this repo (best-effort — never block launch).
+RECALL="$(python3 "$ROOT/scripts/harvest_knowledge.py" --root "$ROOT" --recall "$REPO" 2>/dev/null || true)"
+if [ -n "$RECALL" ]; then
+  SYSPROMPT="$SYSPROMPT
+
+$RECALL"
+fi
 PIDFILE="$ROOT/state/workers/$TASK_ID.pid"
 rm -f "$PIDFILE"   # 이전 (재)기동의 잔여 pidfile 제거
 cd "$WORKTREE"
