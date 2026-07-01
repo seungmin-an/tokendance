@@ -243,14 +243,15 @@ def main(argv=None):
     sp = sub.add_parser("spawn", help="create a queued coding task for a repo")
     sp.add_argument("--repo", required=True)
     sp.add_argument("desc"); sp.add_argument("--id", default=None)
-    dk = sub.add_parser("disk", help="show per-repo pool target/ disk usage")
-    dk.add_argument("--repo", default=None)
-    gc_ = sub.add_parser("gc", help="reclaim idle/oversized pool target/ dirs (--dry-run to preview)")
-    gc_.add_argument("--repo", default=None)
-    gc_.add_argument("--dry-run", action="store_true")
-    wt = sub.add_parser("worktree", help="inspect the warm worktree pool (e.g. worktree ls)")
+    wt = sub.add_parser("worktree", help="inspect/manage the warm worktree pool (ls, disk, gc)")
     wt_sub = wt.add_subparsers(dest="wt_cmd", required=True)
-    wt_ls = wt_sub.add_parser("ls"); wt_ls.add_argument("--repo", default=None)
+    wt_ls = wt_sub.add_parser("ls", help="list pool slots with holder task, state, and target size")
+    wt_ls.add_argument("--repo", default=None)
+    wt_disk = wt_sub.add_parser("disk", help="show per-repo pool target/ disk usage")
+    wt_disk.add_argument("--repo", default=None)
+    wt_gc = wt_sub.add_parser("gc", help="reclaim idle/oversized pool target/ dirs (--dry-run to preview)")
+    wt_gc.add_argument("--repo", default=None)
+    wt_gc.add_argument("--dry-run", action="store_true")
     help_p = sub.add_parser("help", help="show help, optionally for a command")
     help_p.add_argument("topic", nargs="?")
     args = ap.parse_args(argv)
@@ -287,21 +288,22 @@ def main(argv=None):
             print(cmd_spawn(root, args.repo, args.desc, task_id=args.id))
         except ValueError as e:
             print(f"td spawn: {e}", file=sys.stderr); raise SystemExit(1)
-    elif args.cmd == "disk":
-        for r, total, _slots in cmd_disk(root, repo=args.repo):
-            print(f"{os.path.basename(r):24} {total // (1024*1024):>8} MiB  {r}")
-    elif args.cmd == "gc":
-        acts = cmd_gc(root, repo=args.repo, dry_run=args.dry_run)
-        freed = sum(a.get("freed_bytes", 0) for a in acts)
-        for a in acts:
-            print(f"{a['name']}\t{a['reason']}\t{a.get('freed_bytes', 0)}")
-        print(f"FREED\t{freed}")
-    elif args.cmd == "worktree" and args.wt_cmd == "ls":
-        print(f"{'REPO':20} {'SLOT':5} {'STATE':7} {'HOLDER':25} {'TARGET':>8} PATH")
-        for row in cmd_worktree_ls(root, repo=args.repo):
-            print(f"{os.path.basename(row['repo']):20} {row['name']:5} {row['state']:7} "
-                  f"{row['holder'] or '-':25} {row['target_bytes'] // (1024*1024):>6}M "
-                  f"{row['path']}")
+    elif args.cmd == "worktree":
+        if args.wt_cmd == "ls":
+            print(f"{'REPO':20} {'SLOT':5} {'STATE':7} {'HOLDER':25} {'TARGET':>8} PATH")
+            for row in cmd_worktree_ls(root, repo=args.repo):
+                print(f"{os.path.basename(row['repo']):20} {row['name']:5} {row['state']:7} "
+                      f"{row['holder'] or '-':25} {row['target_bytes'] // (1024*1024):>6}M "
+                      f"{row['path']}")
+        elif args.wt_cmd == "disk":
+            for r, total, _slots in cmd_disk(root, repo=args.repo):
+                print(f"{os.path.basename(r):24} {total // (1024*1024):>8} MiB  {r}")
+        elif args.wt_cmd == "gc":
+            acts = cmd_gc(root, repo=args.repo, dry_run=args.dry_run)
+            freed = sum(a.get("freed_bytes", 0) for a in acts)
+            for a in acts:
+                print(f"{a['name']}\t{a['reason']}\t{a.get('freed_bytes', 0)}")
+            print(f"FREED\t{freed}")
 
 
 if __name__ == "__main__":

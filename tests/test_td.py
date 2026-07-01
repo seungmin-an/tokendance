@@ -1,5 +1,5 @@
 # tests/test_td.py
-import os, sys, time, shutil, tempfile, unittest
+import os, re, sys, time, shutil, tempfile, unittest
 import subprocess as _sp
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 import td
@@ -300,3 +300,41 @@ class HelpTest(unittest.TestCase):
     def test_help_topic_shows_command_detail(self):
         out = self._run(["help", "spawn"])
         self.assertIn("--repo", out)
+
+    def test_top_level_help_has_no_standalone_disk_or_gc(self):
+        out = self._run(["help"])
+        self.assertIn("worktree", out)
+        top_level_cmds = re.findall(r"^  (\S+)", out, re.MULTILINE)
+        self.assertNotIn("disk", top_level_cmds)
+        self.assertNotIn("gc", top_level_cmds)
+
+
+class WorktreeDispatchTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.repo = _init_repo(os.path.join(self.tmp, "repo"))
+        TK.create_task(self.tmp, "t1", repo=self.repo)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, argv):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            td.main(["--root", self.tmp, *argv])  # must NOT raise
+        return buf.getvalue()
+
+    def test_worktree_disk_dispatch_runs_without_error(self):
+        pool.acquire(self.repo, "t1", root=self.tmp)
+        out = self._run(["worktree", "disk"])
+        self.assertIn("MiB", out)
+
+    def test_worktree_gc_dry_run_dispatch_runs_without_error(self):
+        out = self._run(["worktree", "gc", "--dry-run"])
+        self.assertIn("FREED", out)
+
+    def test_top_level_disk_is_no_longer_a_valid_command(self):
+        with self.assertRaises(SystemExit) as ctx:
+            td.main(["disk"])
+        self.assertEqual(ctx.exception.code, 2)
