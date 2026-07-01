@@ -298,7 +298,7 @@ def main(argv=None):
             try:
                 print(cmd_spawn(root, args.repo, args.desc, task_id=args.id))
             except ValueError as e:
-                print(f"td spawn: {e}", file=sys.stderr); raise SystemExit(1)
+                print(f"td task spawn: {e}", file=sys.stderr); raise SystemExit(1)
     elif args.cmd == "worktree":
         if args.wt_cmd == "ls":
             print(f"{'REPO':20} {'SLOT':5} {'STATE':7} {'HOLDER':25} {'TARGET':>8} PATH")
