@@ -177,6 +177,8 @@ def recall_block(root, repo):
         cap = 20
     chosen_repo = repo_es[:cap]                      # repo-scoped prioritized
     chosen_pb = pb_es[:max(0, cap - len(chosen_repo))]
+    if not chosen_repo and not chosen_pb:
+        return ""
     dropped = (len(repo_es) - len(chosen_repo)) + (len(pb_es) - len(chosen_pb))
     out = ["## 참고 지식 (library) — 관련 있어 보이면 해당 파일을 Read 하라"]
     if chosen_repo:
@@ -279,7 +281,7 @@ def _build_entry(block, scope, repo, slug):
         "summary": meta.get("summary", ""),
         "tags": meta.get("tags", ""),
         "body": block["body"],
-        "tier": TIER_PRIMARY,   # 워커 log 에서 수확한 지식은 1급(사람이 검증한 작업 산출)
+        "tier": TIER_PRIMARY,   # 워커 knowledge.md 에서 수확한 지식은 1급(사람이 검증한 작업 산출)
         "sources": [],
     }
 

@@ -58,3 +58,12 @@ class RecallTest(unittest.TestCase):
         self.assertNotIn("pb one", out)                     # playbook dropped entirely (cap exhausted by repo)
         self.assertIn("더", out)                            # truncation note present
         self.assertIn("(+2개 더", out)                      # 1 dropped repo entry + 1 dropped playbook
+
+    def test_cap_zero_on_nonempty_ledger_returns_empty(self):
+        with open(os.path.join(self.tmp, "config.local.md"), "w") as f:
+            f.write("RECALL_MAX_ENTRIES=0\n")
+        self._seed(
+            _entry("foo fact", "repo", "foo", "foo-fact"),
+            _entry("pb one", "playbook", None, "pb-one"),
+        )
+        self.assertEqual(HK.recall_block(self.tmp, "/some/path/foo"), "")

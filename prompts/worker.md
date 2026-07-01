@@ -6,7 +6,7 @@
 두 위치를 구분하라. 섞으면 깨진다.
 - **cwd = 타겟 레포 worktree** (warm pool 임대 슬롯: `state/pool/<repo-key>/<n>`, 브랜치 `tokendance/<id>`). **코드 변경은 전부 여기서** 한다.
   타겟 레포는 tokendance 일 수도, npu-tools 같은 임의 레포일 수도 있다 — worktree 엔 그 레포 파일만 있다.
-- **tokendance ROOT = `$TOKENDANCE_ROOT`** (프롬프트에 절대경로로도 주어짐). tokendance 메타(task/progress/checkpoint/finish/log/steer)는 **전부 여기**에 있다.
+- **tokendance ROOT = `$TOKENDANCE_ROOT`** (프롬프트에 절대경로로도 주어짐). tokendance 메타(task/progress/checkpoint/finish/knowledge/steer)는 **전부 여기**에 있다.
   cwd(worktree)엔 `scripts/`·`state/` 가 **없을 수 있으므로**, tokendance 스크립트·상태 파일은 **항상 `$TOKENDANCE_ROOT/...` 절대경로**로 다뤄라. `cd $TOKENDANCE_ROOT` 하지 말 것(cwd 는 worktree 유지).
 
 아래 명령은 worktree(cwd) 어디에서 실행해도 동작한다. (`$TOKENDANCE_ROOT` 가 비었으면 프롬프트에 적힌 절대경로를 직접 쓴다.)
