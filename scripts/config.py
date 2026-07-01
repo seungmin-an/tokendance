@@ -25,6 +25,7 @@ DEFAULTS = {
     "POOL_TARGET_IDLE_DAYS": "14",      # idle-sweep: evict idle slot target/ untouched ≥ this many days; 0 = off
     "POOL_TARGET_USE_CARGO_SWEEP": "0", # 1 = use `cargo sweep` for idle sweep when available
     "POOL_LEASE_TTL_HOURS": "72",  # reclaim a leased slot whose holder is gone or heartbeat older than this; 0 = off (consumed by morning.live_holders)
+    "RECALL_MAX_ENTRIES": "20",  # max library summaries auto-injected into a worker
 }
 
 

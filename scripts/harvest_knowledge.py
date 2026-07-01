@@ -23,6 +23,11 @@ import json
 import os
 import re
 
+try:
+    from scripts import config
+except ImportError:
+    import config
+
 # ── tier (지식 등급) ──
 # 확실한 1급은 primary, 사서가 코드기반으로 채운 불확실 신규는 candidate(격리, 사람 승인 전).
 # 하위호환: tier 필드가 없는(레거시) 엔트리는 primary 로 취급한다.
@@ -136,6 +141,53 @@ def entry_tier(entry):
 
 def is_candidate(entry):
     return entry_tier(entry) == TIER_CANDIDATE
+
+
+# --- recall (읽기 전용, 워커 기동 시 library 리콜) ----------------------------
+
+def _recall_line(e):
+    tags = f" [{e['tags']}]" if e.get("tags") else ""
+    summ = f" — {e['summary']}" if e.get("summary") else ""
+    return f"- {e['title']}{tags}{summ}  (→ library/{e['dest']})"
+
+
+def _repo_key(name):
+    return os.path.basename(os.path.normpath(name or "")).lower()
+
+
+def recall_block(root, repo):
+    """Read-only, best-effort. Compact library recall for a worker on `repo`.
+    Returns "" if the ledger is empty/unreadable or nothing matches."""
+    try:
+        entries = load_ledger(root).get("entries", {})
+    except (OSError, ValueError):
+        return ""
+    target = _repo_key(repo)
+    primary = [e for e in entries.values() if not is_candidate(e)]
+    repo_es = sorted([e for e in primary if e.get("scope") == "repo"
+                      and _repo_key(e.get("repo")) == target],
+                     key=lambda x: x.get("slug", ""))
+    pb_es = sorted([e for e in primary if e.get("scope") == "playbook"],
+                   key=lambda x: x.get("slug", ""))
+    if not repo_es and not pb_es:
+        return ""
+    try:
+        cap = config.get_int("RECALL_MAX_ENTRIES", r=root)
+    except Exception:
+        cap = 20
+    chosen_repo = repo_es[:cap]                      # repo-scoped prioritized
+    chosen_pb = pb_es[:max(0, cap - len(chosen_repo))]
+    dropped = (len(repo_es) - len(chosen_repo)) + (len(pb_es) - len(chosen_pb))
+    out = ["## 참고 지식 (library) — 관련 있어 보이면 해당 파일을 Read 하라"]
+    if chosen_repo:
+        out.append(f"[이 레포: {os.path.basename(os.path.normpath(repo or ''))}]")
+        out += [_recall_line(e) for e in chosen_repo]
+    if chosen_pb:
+        out.append("[공통 플레이북]")
+        out += [_recall_line(e) for e in chosen_pb]
+    if dropped:
+        out.append(f"(+{dropped}개 더 — library/index.md 참고)")
+    return "\n".join(out)
 
 
 # --- ledger 락 (harvest ↔ librarian 직렬화) ----------------------------------
@@ -410,7 +462,12 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         description="워커 knowledge.md 의 '## 지식:' 블록을 library 로 승격(멱등).")
     ap.add_argument("--root", default=_default_root())
+    ap.add_argument("--recall", metavar="REPO", default=None,
+                    help="print the library recall block for REPO and exit (read-only)")
     args = ap.parse_args(argv)
+    if args.recall is not None:
+        print(recall_block(args.root, args.recall))
+        return
     s = harvest(args.root)
     print(f"created={len(s['created'])} updated={len(s['updated'])} "
           f"skipped={len(s['skipped'])}")
