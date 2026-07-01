@@ -292,30 +292,28 @@ class HelpTest(unittest.TestCase):
         self.assertIn("task", out)
         self.assertIn("spawn", out)
 
-    def test_help_lists_subcommands(self):
+    def test_bare_td_prints_tree_not_argparse_dump(self):
+        out = self._run([])
+        self.assertIn("├─", out)
+        self.assertIn("└─", out)
+        self.assertNotIn("usage:", out)
+
+    def test_help_prints_tree_not_argparse_dump(self):
         out = self._run(["help"])
-        for c in ("task", "peek", "steer", "spawn", "worktree"):
+        self.assertIn("├─", out)
+        self.assertIn("└─", out)
+        self.assertNotIn("usage:", out)
+
+    def test_help_lists_groups_and_subcommands(self):
+        out = self._run(["help"])
+        for c in ("task", "worktree", "help",
+                  "ls", "peek", "steer", "spawn", "disk", "gc"):
             self.assertIn(c, out)
 
     def test_help_topic_shows_command_detail(self):
         out = self._run(["help", "task"])
+        self.assertIn("usage: td task", out)
         self.assertIn("spawn", out)
-
-    def test_top_level_help_has_no_standalone_disk_or_gc(self):
-        out = self._run(["help"])
-        self.assertIn("worktree", out)
-        # top-level groups are exactly task/worktree/help; disk/gc/status/peek
-        # are no longer top-level commands, but DO appear nested under their
-        # group's expanded help.
-        top_section = out.split("\n\n", 1)[0]
-        top_level_cmds = re.findall(r"^  (\S+)", top_section, re.MULTILINE)
-        self.assertNotIn("disk", top_level_cmds)
-        self.assertNotIn("gc", top_level_cmds)
-        self.assertNotIn("status", top_level_cmds)
-        self.assertNotIn("peek", top_level_cmds)
-        self.assertIn("disk", out)
-        self.assertIn("gc", out)
-        self.assertIn("peek", out)
 
 
 class WorktreeDispatchTest(unittest.TestCase):

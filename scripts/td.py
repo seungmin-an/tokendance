@@ -222,12 +222,34 @@ def cmd_gc(root, repo=None, dry_run=False):
     return acts
 
 
-def _print_full_help(ap, sub):
-    ap.print_help()
-    for name in ("task", "worktree"):
-        if name in sub.choices:
-            print()
-            sub.choices[name].print_help()
+def _subcommands(parser):
+    """Return a parser's direct subcommands as [(name, help)] in definition
+    order, by introspecting its SubParsersAction (single-sourced from the
+    help= text passed to add_parser — no duplicated descriptions)."""
+    for act in parser._actions:
+        if isinstance(act, argparse._SubParsersAction):
+            return [(a.dest, a.help or "") for a in act._get_subactions()]
+    return []
+
+
+def _ap_choice(ap, name):
+    for act in ap._actions:
+        if isinstance(act, argparse._SubParsersAction):
+            return act.choices.get(name)
+    return None
+
+
+def _print_tree(ap):
+    print("td — tokendance interactive control\n")
+    groups = _subcommands(ap)
+    for gi, (g, gdesc) in enumerate(groups):
+        glast = gi == len(groups) - 1
+        print(f"{'└─' if glast else '├─'} {g:9} {gdesc}")
+        subs = _subcommands(_ap_choice(ap, g))
+        cont = "   " if glast else "│  "
+        for si, (s, sdesc) in enumerate(subs):
+            print(f"{cont}{'└─' if si == len(subs) - 1 else '├─'} {s:9} {sdesc}")
+    print("\nRun 'td <group> <command> -h' for command details.")
 
 
 def main(argv=None):
@@ -270,7 +292,7 @@ def main(argv=None):
         if topic and topic in sub.choices:
             sub.choices[topic].print_help()
         else:
-            _print_full_help(ap, sub)
+            _print_tree(ap)
         return
     root = _root(args.root)
     if args.cmd == "task":
