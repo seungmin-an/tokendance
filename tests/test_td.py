@@ -1,5 +1,5 @@
 # tests/test_td.py
-import os, re, sys, time, shutil, tempfile, unittest
+import os, re, sys, time, types, shutil, tempfile, unittest
 import subprocess as _sp
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 import td
@@ -300,6 +300,121 @@ class SpawnTest(unittest.TestCase):
         tid = td.cmd_spawn(self.tmp, "/r", "do a thing")
         self.assertTrue(tid.endswith("-do-a-thing") or "do-a-thing" in tid)
         self.assertEqual(S.read(self.tmp, tid)["state"], "queued")
+
+
+class OpenTest(unittest.TestCase):
+    """`td task open` — provision a human-driven worktree session (attach's mirror)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.wt = os.path.join(self.tmp, "wt")   # a real dir prepare-worktree "provisions"
+        os.makedirs(self.wt)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _runner(self, tid):
+        """Spy runner: records argv, and for prepare-worktree simulates the real
+        side effect (writes worktree.path — the source of truth cmd_open reads)."""
+        calls = []
+
+        def runner(cmd, **k):
+            calls.append(cmd)
+            if any("prepare-worktree.sh" in str(c) for c in cmd):
+                td_dir = S.task_dir(self.tmp, tid)
+                os.makedirs(td_dir, exist_ok=True)
+                with open(os.path.join(td_dir, "worktree.path"), "w") as f:
+                    f.write(self.wt + "\n")
+            return types.SimpleNamespace(returncode=0, stdout=self.wt + "\n", stderr="")
+
+        return calls, runner
+
+    def _tmux_call(self, calls):
+        return [c for c in calls if any("new-session" in str(x) for x in c)][0]
+
+    def test_open_creates_task_worktree_session_queued_paused(self):
+        calls, runner = self._runner("t-open")
+        td.cmd_open(self.tmp, "/repos/x", "drive it", task_id="t-open",
+                    claude_bin="/fake/claude", runner=runner,
+                    which=lambda _: "/fake/tmux", recall_fn=lambda *a: "")
+        d = S.read(self.tmp, "t-open")
+        self.assertEqual(d["state"], "queued")           # not running → no stale-relaunch
+        self.assertTrue(d["paused"])                     # dispatch blocked while human drives
+        self.assertIsNone(d["worker_pid"])               # no headless worker
+        self.assertTrue(d["worker_session_id"])          # session minted + recorded
+        self.assertEqual(d["repo"], os.path.abspath("/repos/x"))
+        # worktree provisioned via prepare-worktree, path recorded (source of truth)
+        self.assertTrue(any("prepare-worktree.sh" in " ".join(c) for c in calls))
+        self.assertEqual(td._worktree_path(self.tmp, "t-open"), self.wt)
+
+    def test_open_tmux_argv_has_detached_session_cwd_claude_recall(self):
+        calls, runner = self._runner("t-open")
+        td.cmd_open(self.tmp, "/r", "d", task_id="t-open", claude_bin="/fake/claude",
+                    runner=runner, which=lambda _: "/fake/tmux",
+                    recall_fn=lambda *a: "RECALL-BLOB")
+        sid = S.read(self.tmp, "t-open")["worker_session_id"]
+        tmux = self._tmux_call(calls)
+        self.assertEqual(tmux[0], "/fake/tmux")
+        self.assertIn("new-session", tmux)
+        self.assertIn("-d", tmux)                        # detached
+        self.assertIn("td-t-open", tmux)                 # session name = td-<id>
+        self.assertEqual(tmux[tmux.index("-c") + 1], self.wt)   # window cwd = worktree
+        shell_cmd = tmux[-1]
+        self.assertIn("IS_SANDBOX=1", shell_cmd)         # root boot
+        self.assertIn("/fake/claude", shell_cmd)
+        self.assertIn("--session-id", shell_cmd)
+        self.assertIn(sid, shell_cmd)                    # the recorded session id is what claude gets
+        self.assertIn("RECALL-BLOB", shell_cmd)          # library recall injected
+        self.assertNotIn("--dangerously-skip-permissions", shell_cmd)  # default keeps prompts
+
+    def test_open_skip_permissions_adds_flag(self):
+        calls, runner = self._runner("t-open")
+        td.cmd_open(self.tmp, "/r", "d", task_id="t-open", skip_permissions=True,
+                    claude_bin="/fake/claude", runner=runner,
+                    which=lambda _: "/fake/tmux", recall_fn=lambda *a: "")
+        self.assertIn("--dangerously-skip-permissions", self._tmux_call(calls)[-1])
+
+    def test_open_empty_recall_omits_append_system_prompt(self):
+        calls, runner = self._runner("t-open")
+        td.cmd_open(self.tmp, "/r", "d", task_id="t-open", claude_bin="/fake/claude",
+                    runner=runner, which=lambda _: "/fake/tmux", recall_fn=lambda *a: "")
+        self.assertNotIn("--append-system-prompt", self._tmux_call(calls)[-1])
+
+    def test_open_errors_when_tmux_missing_and_provisions_nothing(self):
+        calls = []
+        with self.assertRaises(SystemExit) as ctx:
+            td.cmd_open(self.tmp, "/r", "d", task_id="t-open", claude_bin="/fake/claude",
+                        runner=lambda c, **k: calls.append(c),
+                        which=lambda _: None, recall_fn=lambda *a: "")
+        self.assertNotEqual(ctx.exception.code, 0)
+        self.assertEqual(calls, [])                      # no subprocess ran
+        with self.assertRaises(FileNotFoundError):       # errored before creating the task
+            S.read(self.tmp, "t-open")
+
+    def test_open_errors_when_claude_unset(self):
+        old = os.environ.pop("TOKENDANCE_CLAUDE", None)
+        self.addCleanup(lambda: os.environ.__setitem__("TOKENDANCE_CLAUDE", old)
+                        if old is not None else None)
+        with self.assertRaises(SystemExit):
+            td.cmd_open(self.tmp, "/r", "d", task_id="t-open", claude_bin=None,
+                        which=lambda _: "/fake/tmux", recall_fn=lambda *a: "")
+
+    def test_open_errors_when_worktree_provisioning_fails(self):
+        def runner(cmd, **k):
+            if any("prepare-worktree.sh" in str(c) for c in cmd):
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="boom")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        with self.assertRaises(SystemExit) as ctx:
+            td.cmd_open(self.tmp, "/r", "d", task_id="t-open", claude_bin="/fake/claude",
+                        runner=runner, which=lambda _: "/fake/tmux", recall_fn=lambda *a: "")
+        self.assertNotEqual(ctx.exception.code, 0)
+
+    def test_help_tree_includes_open(self):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            td.main(["help"])
+        self.assertIn("open", buf.getvalue())
 
 
 class DiskGcTest(unittest.TestCase):
