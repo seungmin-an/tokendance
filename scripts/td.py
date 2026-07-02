@@ -188,6 +188,66 @@ def cmd_abort(root, task_id, mode="requeue", runner=subprocess.run):
                                  "worker_pid": None, "worker_session_id": None})
 
 
+def _worktree_path(root, task_id):
+    """The task's leased worktree abs path (written by prepare-worktree.sh to
+    <task_dir>/worktree.path). None if unrecorded. The path travels with the task
+    dir on state moves, so resolving via S.task_dir stays correct for any state."""
+    return _read(os.path.join(S.task_dir(root, task_id), "worktree.path")) or None
+
+
+def _exec_attach(claude, argv, cwd, env):
+    """Replace this process with an interactive claude in the worktree (like
+    cmd_logs' tail-follow). Wrapped so tests can inject a spy instead of exec."""
+    os.chdir(cwd)
+    os.execvpe(claude, argv, env)
+
+
+def cmd_attach(root, task_id, skip_permissions=False, claude_bin=None, execer=_exec_attach):
+    """Hand a worker's session over to a human at an interactive terminal.
+
+    Stops the worker first (pause → confirm dead) so one session file isn't driven
+    by two processes at once, then execs `claude --resume <sid>` in the worktree.
+    Leaves the task queued+paused with no pid: `queued` keeps the supervisor's
+    stale detector (running-only) from relaunching a headless worker onto the live
+    session, `paused` blocks dispatch during the handover, and the pair lets a later
+    `td task resume` auto-continue via launch-worker.sh --resume (dispatch is
+    queued-only). The session id is preserved so that resume picks up where the
+    human left off."""
+    root = _root(root)
+    d = S.read(root, task_id)
+    sid = d.get("worker_session_id")
+    if not sid:
+        print(f"td task attach: {task_id} has no worker_session_id — nothing to attach",
+              file=sys.stderr)
+        raise SystemExit(1)
+    wt = _worktree_path(root, task_id)
+    if not wt or not os.path.isdir(wt):
+        print(f"td task attach: no worktree for {task_id} ({wt or 'unrecorded'}) — cannot attach",
+              file=sys.stderr)
+        raise SystemExit(1)
+    claude = claude_bin or os.environ.get("TOKENDANCE_CLAUDE")
+    if not claude:
+        print("td task attach: TOKENDANCE_CLAUDE unset — cannot locate the claude binary",
+              file=sys.stderr)
+        raise SystemExit(1)
+    # Safe takeover: block re-dispatch first, then stop the worker if it's still
+    # alive (two processes on one session file corrupt/fork it). Dead worker → skip.
+    S.update(root, task_id, {"paused": True})
+    pid = _worker_pid(root, task_id)
+    if pid is not None and _alive(pid):
+        _kill_worker(root, task_id)
+    # State reconciliation (#5): out of `running` (no stale-relaunch), pid cleared.
+    S.update(root, task_id, {"state": "queued", "worker_pid": None})
+    argv = [claude, "--resume", sid]
+    if skip_permissions:
+        argv.append("--dangerously-skip-permissions")
+    env = {**os.environ, "IS_SANDBOX": "1"}   # allow claude to boot as root
+    print(f"attaching to {task_id}: resuming session {sid[:8]} in {wt}\n"
+          f"worker stopped + paused; run 'td task resume {task_id}' after you exit "
+          f"to auto-continue headless.", file=sys.stderr)
+    execer(claude, argv, wt, env)
+
+
 def _repos(root):
     return sorted({os.path.abspath(d["repo"]) for d in TK.list_tasks(root) if d.get("repo")})
 
@@ -272,6 +332,10 @@ def main(argv=None):
     ab = task_sub.add_parser("abort", help="kill a worker; requeue (or --fail)")
     ab.add_argument("task_id")
     ab.add_argument("--fail", action="store_true", help="mark failed instead of requeue")
+    at = task_sub.add_parser("attach", help="stop a worker and take over its session interactively (claude --resume)")
+    at.add_argument("task_id")
+    at.add_argument("--skip-permissions", action="store_true",
+                    help="pass --dangerously-skip-permissions (default: keep interactive permission prompts)")
     sp = task_sub.add_parser("spawn", help="create a queued coding task for a repo")
     sp.add_argument("--repo", required=True)
     sp.add_argument("desc"); sp.add_argument("--id", default=None)
@@ -316,6 +380,8 @@ def main(argv=None):
             cmd_redirect(root, args.task_id, args.msg)
         elif args.task_cmd == "abort":
             cmd_abort(root, args.task_id, mode="fail" if args.fail else "requeue")
+        elif args.task_cmd == "attach":
+            cmd_attach(root, args.task_id, skip_permissions=args.skip_permissions)
         elif args.task_cmd == "spawn":
             try:
                 print(cmd_spawn(root, args.repo, args.desc, task_id=args.id))
