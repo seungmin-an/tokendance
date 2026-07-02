@@ -4,10 +4,13 @@ file-state protocol + warm pool. stdlib-only."""
 import argparse
 import os
 import re
+import shlex
+import shutil
 import signal
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -248,6 +251,90 @@ def cmd_attach(root, task_id, skip_permissions=False, claude_bin=None, execer=_e
     execer(claude, argv, wt, env)
 
 
+def _recall_block(root, repo):
+    """Library recall for a worker on `repo` — the same source launch-worker.sh
+    injects (harvest_knowledge.recall_block, which `--recall` also calls).
+    Best-effort: any failure yields "" so it never blocks provisioning."""
+    try:
+        import harvest_knowledge as HK
+        return HK.recall_block(root, os.path.abspath(repo))
+    except Exception:
+        return ""
+
+
+def cmd_open(root, repo, desc="", task_id=None, skip_permissions=False,
+             claude_bin=None, runner=subprocess.run, which=shutil.which,
+             recall_fn=_recall_block):
+    """Provision a human-driven worktree session (tmux + claude + recall).
+
+    The forward mirror of cmd_attach: attach hands an *existing* worker session to
+    a human, open *starts* a fresh one a human drives — and both end in the same
+    state so the two are reversible. A detached tmux session `td-<id>` is created
+    whose window runs `claude --session-id <new-uuid>` in the leased worktree with
+    the repo's library recall appended; the user runs `tmux attach -t td-<id>`.
+
+    The task is left queued+paused with the minted session id and no pid: `queued`
+    keeps the supervisor's stale detector (running-only) from launching a headless
+    worker onto the live session, `paused` blocks dispatch while the human drives,
+    and the pair lets a later `td task resume` offload the work headless via
+    launch-worker.sh --resume (dispatch is queued-only), reusing the same session."""
+    root = _root(root)
+    claude = claude_bin or os.environ.get("TOKENDANCE_CLAUDE")
+    if not claude:
+        print("td task open: TOKENDANCE_CLAUDE unset — cannot locate the claude binary",
+              file=sys.stderr)
+        raise SystemExit(1)
+    tmux = which("tmux")
+    if not tmux:
+        print("td task open: tmux not found on PATH — install tmux or run headless via 'td task spawn'",
+              file=sys.stderr)
+        raise SystemExit(1)
+    # Create the tracked task (reuses spawn's id rule + status scaffolding), then
+    # pause immediately so dispatch can't grab it before the worktree/session exist.
+    task_id = cmd_spawn(root, repo, desc, task_id=task_id)
+    S.update(root, task_id, {"paused": True})
+    # Provision the isolated worktree (pool lease + branch tokendance/<id> + records
+    # worktree.path). Pass root through so prepare-worktree resolves the same tree.
+    prep = runner(["bash", _script(root, "prepare-worktree.sh"), task_id],
+                  capture_output=True, text=True,
+                  env={**os.environ, "TOKENDANCE_ROOT": root})
+    if getattr(prep, "returncode", 1) != 0:
+        print(f"td task open: worktree provisioning failed for {task_id} "
+              f"(discard with 'td task abort {task_id}'):\n{getattr(prep, 'stderr', '') or ''}".rstrip(),
+              file=sys.stderr)
+        raise SystemExit(1)
+    wt = _worktree_path(root, task_id)
+    if not wt or not os.path.isdir(wt):
+        print(f"td task open: no worktree recorded for {task_id} ({wt or 'unrecorded'}) "
+              f"— discard with 'td task abort {task_id}'", file=sys.stderr)
+        raise SystemExit(1)
+    # Mint the session up front (like launch-worker) and record it; worker_pid stays
+    # None (init default). resume tolerates a missing session file → clean fresh boot.
+    sid = str(uuid.uuid4())
+    S.update(root, task_id, {"worker_session_id": sid})
+    recall = recall_fn(root, repo)
+    inner = ["env", "IS_SANDBOX=1", claude, "--session-id", sid]
+    if recall:                                    # empty recall → omit the flag entirely
+        inner += ["--append-system-prompt", recall]
+    if skip_permissions:                          # default keeps interactive permission prompts
+        inner.append("--dangerously-skip-permissions")
+    session_name = f"td-{task_id}"
+    shell_cmd = " ".join(shlex.quote(a) for a in inner)   # tmux runs this via the shell
+    tmux_cmd = [tmux, "new-session", "-d", "-s", session_name, "-c", wt, shell_cmd]
+    res = runner(tmux_cmd, capture_output=True, text=True)
+    if getattr(res, "returncode", 1) != 0:
+        print(f"td task open: tmux failed to create session {session_name} "
+              f"(name in use? kill it or discard with 'td task abort {task_id}'):\n"
+              f"{getattr(res, 'stderr', '') or ''}".rstrip(), file=sys.stderr)
+        raise SystemExit(1)
+    print(f"opened {task_id}: human-driven session {session_name} (detached) in {wt}\n"
+          f"  attach:  tmux attach -t {session_name}\n"
+          f"  offload: td task resume {task_id}   (hand off to a headless worker)\n"
+          f"  reclaim: td task abort {task_id}    (discard worktree when done)",
+          file=sys.stderr)
+    return task_id
+
+
 def _repos(root):
     return sorted({os.path.abspath(d["repo"]) for d in TK.list_tasks(root) if d.get("repo")})
 
@@ -339,6 +426,12 @@ def main(argv=None):
     sp = task_sub.add_parser("spawn", help="create a queued coding task for a repo")
     sp.add_argument("--repo", required=True)
     sp.add_argument("desc"); sp.add_argument("--id", default=None)
+    op = task_sub.add_parser("open", help="provision a human-driven worktree session (tmux + claude + recall); offload later with resume")
+    op.add_argument("--repo", required=True)
+    op.add_argument("desc", nargs="?", default="")
+    op.add_argument("--id", default=None)
+    op.add_argument("--skip-permissions", action="store_true",
+                    help="pass --dangerously-skip-permissions (default: keep interactive permission prompts)")
     wt = sub.add_parser("worktree", help="inspect/manage the warm worktree pool (ls, disk, gc)")
     wt_sub = wt.add_subparsers(dest="wt_cmd", required=True)
     wt_ls = wt_sub.add_parser("ls", help="list pool slots with holder task, state, and target size")
@@ -387,6 +480,12 @@ def main(argv=None):
                 print(cmd_spawn(root, args.repo, args.desc, task_id=args.id))
             except ValueError as e:
                 print(f"td task spawn: {e}", file=sys.stderr); raise SystemExit(1)
+        elif args.task_cmd == "open":
+            try:
+                print(cmd_open(root, args.repo, args.desc, task_id=args.id,
+                               skip_permissions=args.skip_permissions))
+            except ValueError as e:
+                print(f"td task open: {e}", file=sys.stderr); raise SystemExit(1)
     elif args.cmd == "worktree":
         if args.wt_cmd == "ls":
             print(f"{'REPO':20} {'SLOT':5} {'STATE':7} {'HOLDER':25} {'TARGET':>8} PATH")
