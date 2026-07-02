@@ -199,6 +199,87 @@ class InterveneTest(unittest.TestCase):
         self.assertTrue(any("launch-worker.sh" in " ".join(c) and "--resume" in c for c in calls))
 
 
+class AttachTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        TK.create_task(self.tmp, "t1", repo="/r")
+        S.update(self.tmp, "t1", {"state": "running", "worker_session_id": "SID-123"})
+        self.wt = os.path.join(self.tmp, "wt")           # a real dir to attach into
+        os.makedirs(self.wt)
+        with open(os.path.join(S.task_dir(self.tmp, "t1"), "worktree.path"), "w") as f:
+            f.write(self.wt + "\n")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _spy_execer(self):
+        calls = []
+        def execer(claude, argv, cwd, env):
+            calls.append({"claude": claude, "argv": argv, "cwd": cwd, "env": env})
+        return calls, execer
+
+    def test_attach_errors_when_no_session(self):
+        S.update(self.tmp, "t1", {"worker_session_id": None})
+        calls, execer = self._spy_execer()
+        with self.assertRaises(SystemExit) as ctx:
+            td.cmd_attach(self.tmp, "t1", claude_bin="/fake/claude", execer=execer)
+        self.assertNotEqual(ctx.exception.code, 0)   # non-zero exit
+        self.assertEqual(calls, [])                  # never hands over
+
+    def test_attach_errors_when_no_worktree(self):
+        os.remove(os.path.join(S.task_dir(self.tmp, "t1"), "worktree.path"))
+        calls, execer = self._spy_execer()
+        with self.assertRaises(SystemExit):
+            td.cmd_attach(self.tmp, "t1", claude_bin="/fake/claude", execer=execer)
+        self.assertEqual(calls, [])
+
+    def test_attach_live_worker_pauses_kills_then_resumes(self):
+        pid = _spawn_orphan(["sleep", "30"])
+        S.update(self.tmp, "t1", {"worker_pid": pid})
+        self.addCleanup(lambda: (os.kill(pid, 9) if td._alive(pid) else None))
+        calls, execer = self._spy_execer()
+        td.cmd_attach(self.tmp, "t1", claude_bin="/fake/claude", execer=execer)
+        self.assertFalse(td._alive(pid))             # worker stopped before handover
+        d = S.read(self.tmp, "t1")
+        self.assertEqual(d["state"], "queued")       # out of running (no stale-relaunch)
+        self.assertTrue(d["paused"])                 # dispatch blocked during handover
+        self.assertIsNone(d["worker_pid"])           # dead pid cleared
+        self.assertEqual(d["worker_session_id"], "SID-123")  # session preserved for resume
+        self.assertEqual(len(calls), 1)
+        c = calls[0]
+        self.assertEqual(c["claude"], "/fake/claude")
+        self.assertEqual(c["cwd"], self.wt)          # cwd = worktree
+        self.assertEqual(c["argv"][:3], ["/fake/claude", "--resume", "SID-123"])
+        self.assertEqual(c["env"]["IS_SANDBOX"], "1")
+        self.assertNotIn("--dangerously-skip-permissions", c["argv"])  # default keeps prompts
+
+    def test_attach_dead_worker_skips_kill_and_resumes(self):
+        pid = _spawn_orphan(["sleep", "30"])
+        os.kill(pid, 9)
+        td._wait_dead(pid, 2.0)
+        self.assertFalse(td._alive(pid))
+        S.update(self.tmp, "t1", {"worker_pid": pid})
+        killed = []
+        orig = td._kill_worker
+        td._kill_worker = lambda *a, **k: killed.append(True)
+        self.addCleanup(lambda: setattr(td, "_kill_worker", orig))
+        calls, execer = self._spy_execer()
+        td.cmd_attach(self.tmp, "t1", claude_bin="/fake/claude", execer=execer)
+        self.assertEqual(killed, [])                 # dead worker → kill skipped
+        self.assertEqual(len(calls), 1)              # went straight to resume
+        d = S.read(self.tmp, "t1")
+        self.assertEqual(d["state"], "queued")
+        self.assertTrue(d["paused"])
+        self.assertIsNone(d["worker_pid"])
+
+    def test_attach_skip_permissions_adds_flag(self):
+        S.update(self.tmp, "t1", {"worker_pid": None})   # no live worker
+        calls, execer = self._spy_execer()
+        td.cmd_attach(self.tmp, "t1", skip_permissions=True,
+                      claude_bin="/fake/claude", execer=execer)
+        self.assertIn("--dangerously-skip-permissions", calls[0]["argv"])
+
+
 class SpawnTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
