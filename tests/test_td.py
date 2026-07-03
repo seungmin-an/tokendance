@@ -40,6 +40,15 @@ class ReadCommandsTest(unittest.TestCase):
         self.assertIn("t1", ids)
         self.assertEqual(ids["t1"][1], "running")
 
+    def test_status_reports_worktree_path_or_none(self):
+        TK.create_task(self.tmp, "t1", title="A", repo="/r")   # leased
+        TK.create_task(self.tmp, "t2", title="B", repo="/r")   # never leased
+        with open(os.path.join(S.task_dir(self.tmp, "t1"), "worktree.path"), "w") as f:
+            f.write("/leased/wt/t1\n")
+        rows = {r[0]: r for r in td.cmd_status(self.tmp)}
+        self.assertEqual(rows["t1"][5], "/leased/wt/t1")  # recorded → abs path (last column)
+        self.assertIsNone(rows["t2"][5])                  # unrecorded → None (rendered as -)
+
     def test_peek_shows_progress_and_pending_steer_without_consuming(self):
         TK.create_task(self.tmp, "t1", repo="/r")
         td_dir = S.task_dir(self.tmp, "t1")
@@ -562,6 +571,16 @@ class TaskNamespaceTest(unittest.TestCase):
     def test_task_ls_lists_tasks(self):
         out = self._run(["task", "ls"])
         self.assertIn("t1", out)
+
+    def test_task_ls_shows_worktree_path_column(self):
+        with open(os.path.join(S.task_dir(self.tmp, "t1"), "worktree.path"), "w") as f:
+            f.write("/leased/wt/t1\n")
+        TK.create_task(self.tmp, "t2", repo=self.repo)   # no worktree.path
+        out = self._run(["task", "ls"])
+        self.assertIn("WORKTREE", out)                   # header column added
+        self.assertIn("/leased/wt/t1", out)              # (a) leased task shows its path
+        t2_line = next(ln for ln in out.splitlines() if ln.startswith("t2 "))
+        self.assertTrue(t2_line.rstrip().endswith("-"))  # (b) unleased task shows -
 
     def test_task_spawn_creates_queued_task(self):
         out = self._run(["task", "spawn", "--repo", self.repo, "desc"])

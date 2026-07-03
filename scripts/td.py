@@ -79,7 +79,8 @@ def cmd_status(root):
         age_s = f"{int(age)}s" if age is not None else "-"
         rows.append((d["id"], d.get("state", ""), age_s,
                      str(d.get("attempts", 0)),
-                     "paused" if d.get("paused") else ""))
+                     "paused" if d.get("paused") else "",
+                     _worktree_path(root, d["id"])))  # abs path, or None if unleased
     return rows
 
 
@@ -454,9 +455,9 @@ def main(argv=None):
     root = _root(args.root)
     if args.cmd == "task":
         if args.task_cmd == "ls":
-            print(f"{'ID':24} {'STATE':12} {'HB':8} {'ATT':4} FLAG")
-            for tid, st, age, att, flag in cmd_status(root):
-                print(f"{tid:24} {st:12} {age:8} {att:4} {flag}")
+            print(f"{'ID':24} {'STATE':12} {'HB':8} {'ATT':4} {'FLAG':8} WORKTREE")
+            for tid, st, age, att, flag, wt in cmd_status(root):
+                print(f"{tid:24} {st:12} {age:8} {att:4} {flag:8} {wt or '-'}")
         elif args.task_cmd == "peek":
             print(cmd_peek(root, args.task_id, log_lines=args.n))
         elif args.task_cmd == "logs":
