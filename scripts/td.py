@@ -199,24 +199,39 @@ def _worktree_path(root, task_id):
     return _read(os.path.join(S.task_dir(root, task_id), "worktree.path")) or None
 
 
-def _exec_attach(claude, argv, cwd, env):
-    """Replace this process with an interactive claude in the worktree (like
-    cmd_logs' tail-follow). Wrapped so tests can inject a spy instead of exec."""
-    os.chdir(cwd)
-    os.execvpe(claude, argv, env)
+def _tmux_new_session_cmd(tmux, session_name, cwd, inner):
+    """The `tmux new-session -d` argv that runs `inner` (a command argv) in `cwd`
+    under `session_name`. Single-sources the detached-session provisioning shape
+    shared by cmd_open (fresh --session-id) and cmd_attach (--resume): tmux runs
+    the window command through a shell, so `inner` is shlex-quoted into one string."""
+    return [tmux, "new-session", "-d", "-s", session_name, "-c", cwd,
+            " ".join(shlex.quote(a) for a in inner)]
 
 
-def cmd_attach(root, task_id, skip_permissions=False, claude_bin=None, execer=_exec_attach):
-    """Hand a worker's session over to a human at an interactive terminal.
+def _exec_tmux_attach(tmux, session_name):
+    """Replace this process with `tmux attach -t <session>` (drops the human into
+    the live claude session; like cmd_logs' tail-follow). Wrapped so tests can
+    inject a spy instead of exec."""
+    os.execvp(tmux, [tmux, "attach", "-t", session_name])
+
+
+def cmd_attach(root, task_id, skip_permissions=False, claude_bin=None,
+               runner=subprocess.run, which=shutil.which, execer=_exec_tmux_attach):
+    """Hand a worker's session over to a human, inside a tmux session they can detach.
 
     Stops the worker first (pause → confirm dead) so one session file isn't driven
-    by two processes at once, then execs `claude --resume <sid>` in the worktree.
-    Leaves the task queued+paused with no pid: `queued` keeps the supervisor's
-    stale detector (running-only) from relaunching a headless worker onto the live
-    session, `paused` blocks dispatch during the handover, and the pair lets a later
-    `td task resume` auto-continue via launch-worker.sh --resume (dispatch is
-    queued-only). The session id is preserved so that resume picks up where the
-    human left off."""
+    by two processes at once, then runs `claude --resume <sid>` in a detached tmux
+    session `td-<id>` in the worktree and attaches the human to it (mirrors cmd_open's
+    provisioning). Leaves the task queued+paused with no pid: `queued` keeps the
+    supervisor's stale detector (running-only) from relaunching a headless worker onto
+    the live session, `paused` blocks dispatch during the handover, and the pair lets a
+    later `td task resume` auto-continue via launch-worker.sh --resume (dispatch is
+    queued-only). The session id is preserved so resume picks up where the human left off.
+
+    Detaching (Ctrl-b d) leaves claude *alive* in the tmux session — a headless
+    `td task resume` would then put a second claude on the same session file. So the
+    handover message tells the human to END the tmux session (not just detach) before
+    resuming headless; we can't guard that here without reaching outside attach's scope."""
     root = _root(root)
     d = S.read(root, task_id)
     sid = d.get("worker_session_id")
@@ -234,6 +249,11 @@ def cmd_attach(root, task_id, skip_permissions=False, claude_bin=None, execer=_e
         print("td task attach: TOKENDANCE_CLAUDE unset — cannot locate the claude binary",
               file=sys.stderr)
         raise SystemExit(1)
+    tmux = which("tmux")
+    if not tmux:
+        print("td task attach: tmux not found on PATH — install tmux or resume headless via 'td task resume'",
+              file=sys.stderr)
+        raise SystemExit(1)
     # Safe takeover: block re-dispatch first, then stop the worker if it's still
     # alive (two processes on one session file corrupt/fork it). Dead worker → skip.
     S.update(root, task_id, {"paused": True})
@@ -242,14 +262,29 @@ def cmd_attach(root, task_id, skip_permissions=False, claude_bin=None, execer=_e
         _kill_worker(root, task_id)
     # State reconciliation (#5): out of `running` (no stale-relaunch), pid cleared.
     S.update(root, task_id, {"state": "queued", "worker_pid": None})
-    argv = [claude, "--resume", sid]
-    if skip_permissions:
-        argv.append("--dangerously-skip-permissions")
-    env = {**os.environ, "IS_SANDBOX": "1"}   # allow claude to boot as root
-    print(f"attaching to {task_id}: resuming session {sid[:8]} in {wt}\n"
-          f"worker stopped + paused; run 'td task resume {task_id}' after you exit "
-          f"to auto-continue headless.", file=sys.stderr)
-    execer(claude, argv, wt, env)
+    # Reuse an existing td-<id> session (e.g. from a prior open/attach) rather than
+    # letting new-session fail silently on the name clash; otherwise create it detached.
+    session_name = f"td-{task_id}"
+    exists = getattr(runner([tmux, "has-session", "-t", session_name],
+                            capture_output=True, text=True), "returncode", 1) == 0
+    if not exists:
+        inner = ["env", "IS_SANDBOX=1", claude, "--resume", sid]  # IS_SANDBOX → root boot
+        if skip_permissions:                     # default keeps interactive permission prompts
+            inner.append("--dangerously-skip-permissions")
+        res = runner(_tmux_new_session_cmd(tmux, session_name, wt, inner),
+                     capture_output=True, text=True)
+        if getattr(res, "returncode", 1) != 0:
+            print(f"td task attach: tmux failed to create session {session_name}:\n"
+                  f"{getattr(res, 'stderr', '') or ''}".rstrip(), file=sys.stderr)
+            raise SystemExit(1)
+    print(f"attaching to {task_id}: {'joining existing' if exists else 'resuming'} session "
+          f"{sid[:8]} in tmux {session_name} ({wt})\n"
+          f"  detach: Ctrl-b d  (claude keeps running in the background)\n"
+          f"  resume headless: END this tmux session first (exit claude / "
+          f"tmux kill-session -t {session_name}), then 'td task resume {task_id}' — a\n"
+          f"  still-detached session would collide with the headless worker on the same "
+          f"session file.", file=sys.stderr)
+    execer(tmux, session_name)
 
 
 def _recall_block(root, repo):
@@ -320,9 +355,8 @@ def cmd_open(root, repo, desc="", task_id=None, skip_permissions=False,
     if skip_permissions:                          # default keeps interactive permission prompts
         inner.append("--dangerously-skip-permissions")
     session_name = f"td-{task_id}"
-    shell_cmd = " ".join(shlex.quote(a) for a in inner)   # tmux runs this via the shell
-    tmux_cmd = [tmux, "new-session", "-d", "-s", session_name, "-c", wt, shell_cmd]
-    res = runner(tmux_cmd, capture_output=True, text=True)
+    res = runner(_tmux_new_session_cmd(tmux, session_name, wt, inner),
+                 capture_output=True, text=True)
     if getattr(res, "returncode", 1) != 0:
         print(f"td task open: tmux failed to create session {session_name} "
               f"(name in use? kill it or discard with 'td task abort {task_id}'):\n"
@@ -420,7 +454,7 @@ def main(argv=None):
     ab = task_sub.add_parser("abort", help="kill a worker; requeue (or --fail)")
     ab.add_argument("task_id")
     ab.add_argument("--fail", action="store_true", help="mark failed instead of requeue")
-    at = task_sub.add_parser("attach", help="stop a worker and take over its session interactively (claude --resume)")
+    at = task_sub.add_parser("attach", help="stop a worker and take over its session in tmux (claude --resume; detach with Ctrl-b d)")
     at.add_argument("task_id")
     at.add_argument("--skip-permissions", action="store_true",
                     help="pass --dangerously-skip-permissions (default: keep interactive permission prompts)")
