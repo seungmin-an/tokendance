@@ -460,8 +460,17 @@ def tick(root, claude_bin, run_state=None):
 
 
 def has_active_work(root):
-    """이번 틱에 마스터가 처리할 일감이 있는가(= idle 이 아닌가)."""
-    return any(TK.list_tasks(root, state=s) for s in ACTIVE_STATES)
+    """이번 틱에 마스터가 처리할 일감이 있는가(= idle 이 아닌가).
+
+    paused 태스크는 제외한다(cycle.py 의 디스패치 스킵과 동일 규약) — 사람 소유
+    세션 등 마스터가 능동 처리하지 않는 태스크가 큐에 있어도 idle 로 봐야 사서
+    윈도와 마스터 백오프 게이트가 정상 동작한다.
+    """
+    for s in ACTIVE_STATES:
+        for d in TK.list_tasks(root, state=s):
+            if not d.get("paused"):
+                return True
+    return False
 
 
 # ── 사서(librarian) 트리거 ──

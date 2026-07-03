@@ -124,6 +124,20 @@ class HasActiveWorkTest(unittest.TestCase):
         S.update(self.root, "t3", {"state": "done"})
         self.assertFalse(SV.has_active_work(self.root))
 
+    def test_paused_queued_is_idle(self):
+        # paused 큐(사람 소유 리뷰 세션 등)만 있으면 마스터가 능동 처리하지 않으므로 idle.
+        # cycle.py 디스패치 스킵과 동일 규약 — 사서 윈도·백오프 게이트를 열어둔다.
+        TK.create_task(self.root, "t1")  # 기본 queued
+        S.update(self.root, "t1", {"paused": True})  # status.py 경로(= set --paused)
+        self.assertFalse(SV.has_active_work(self.root))
+
+    def test_paused_plus_normal_queued_is_active(self):
+        # paused 큐 1건 + 일반 큐 1건이면 처리할 일감(t2)이 있으므로 active.
+        TK.create_task(self.root, "t1")
+        S.update(self.root, "t1", {"paused": True})
+        TK.create_task(self.root, "t2")  # 일반 queued
+        self.assertTrue(SV.has_active_work(self.root))
+
 
 def _dead(pid):
     return False
