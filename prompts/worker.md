@@ -17,10 +17,20 @@
 - 변경은 cwd(타겟 레포 worktree)의 브랜치 `tokendance/<id>` 에서. 어떤 레포든 main 직접 push 금지.
 - **아티팩트는 재사용된다 — 새로 받지 마라.** 레포가 `.tokendance-worktree.manifest`/`.tokendance-worktree.env` 를 두면 무거운 아티팩트(libtorch 등)가 메인 체크아웃에서 symlink/env 로 자동 제공된다. 예) npu-tools: `LIBTORCH` 가 이미 주입돼 있으니 `dvc pull` 이나 수동 `export LIBTORCH=...` 하지 말고 그대로 빌드/테스트하라(`echo $LIBTORCH` 로 확인).
 
+## 작업 방식 (항상 superpowers 스킬 사용)
+- 모든 일감에서 **먼저 작업 성격에 맞는 superpowers 스킬을 `Skill` 툴로 발동**하고 그 워크플로를 따라라. 스킬은 흔한 실수를 막는 검증된 절차다 — 즉흥적으로 진행하지 마라.
+- 예시: 기능/버그 구현은 `brainstorming` → `test-driven-development`, 버그 추적은 `systematic-debugging`, 완료 주장 전에는 `verification-before-completion`.
+- 스킬 워크플로가 명백히 과할 때(예: 문서 한 줄 수정)에 한해, **task.md 가 명시적으로 면제**하면 생략할 수 있다.
+
 ## 진행 (각 의미 있는 단계 경계마다)
 1. `$TOKENDANCE_ROOT/state/tasks/<id>/progress.md` 갱신: 현재 단계 / 하는 일 / 애매한 점 / 한 가정 / 자체점검.
 2. `python3 $TOKENDANCE_ROOT/scripts/checkpoint.py <id>` 실행 → heartbeat 갱신 + 새 steer 를 출력한다. 출력이 있으면 반영하고 `$TOKENDANCE_ROOT/state/tasks/<id>/progress.md` 에 반영 사실을 남긴다.
    (heartbeat 가 ~20분 멈추면 죽은 워커로 간주됨 — 긴 작업 전후로 자주 호출.)
+
+## 장시간 작업 (수십 분+ 빌드/테스트)
+- **daemonize 하라**: 세션 teardown 을 견디도록 `setsid nohup bash run.sh` 로 워커 세션과 분리해 실행하고, 완료 마커 파일(예 `run.done` 에 exit code)과 로그 파일로 결과를 세션 넘어 확인한다. harness background 자식은 세션 종료와 함께 죽는다 — 세션 수명 초과 작업은 반드시 분리. (검증됨: npu-tools-build, qwen3-compile-test.)
+- **대기 중 heartbeat 유지**: 완료를 기다리며 워커가 idle 하면 heartbeat 가 끊겨 supervisor 가 fast-crash/stale 로 오판, attempts 를 소진(needs_human)시킬 수 있다. 완료 대기를 **폴링 루프 + 주기적 `checkpoint.py`** 로 돌려 heartbeat 를 살려둘 것.
+- **alloc 튜닝 env 임의설정 금지**: `MALLOC_ARENA_MAX` 등 메모리 튜닝 env 는 레포 표준을 따르고 임의로 넣지 마라. (예: mimalloc off + `MALLOC_ARENA_MAX=2` + 다수 스레드 = malloc arena 락 경합으로 CPU 의 ~75% 가 sys 에서 낭비, 컴파일 2배+ 지연.)
 
 ## 종료 (`$TOKENDANCE_ROOT/scripts/finish.py`)
 - 완료 → 결과(브랜치/산출물 경로)를 progress.md 에 적고 `python3 $TOKENDANCE_ROOT/scripts/finish.py <id> --review`.

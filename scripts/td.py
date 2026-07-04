@@ -19,6 +19,7 @@ import tasks as TK
 import config
 import pool
 import checkpoint as CP
+import backlog as BL
 
 
 def _root(root=None):
@@ -38,6 +39,18 @@ def _hb_age(hb, now=None):
     except (TypeError, ValueError):
         return None
     return (now if now is not None else time.time()) - t
+
+
+def _age(iso, now=None):
+    """Compact human age (3d/5h/2m/10s) from an ISO-UTC timestamp; '-' if unparseable."""
+    secs = _hb_age(iso, now)
+    if secs is None:
+        return "-"
+    secs = int(secs)
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= size:
+            return f"{secs // size}{unit}"
+    return f"{secs}s"
 
 
 def _read(p):
@@ -79,7 +92,8 @@ def cmd_status(root):
         age_s = f"{int(age)}s" if age is not None else "-"
         rows.append((d["id"], d.get("state", ""), age_s,
                      str(d.get("attempts", 0)),
-                     "paused" if d.get("paused") else ""))
+                     "paused" if d.get("paused") else "",
+                     _worktree_path(root, d["id"])))  # abs path, or None if unleased
     return rows
 
 
@@ -198,24 +212,39 @@ def _worktree_path(root, task_id):
     return _read(os.path.join(S.task_dir(root, task_id), "worktree.path")) or None
 
 
-def _exec_attach(claude, argv, cwd, env):
-    """Replace this process with an interactive claude in the worktree (like
-    cmd_logs' tail-follow). Wrapped so tests can inject a spy instead of exec."""
-    os.chdir(cwd)
-    os.execvpe(claude, argv, env)
+def _tmux_new_session_cmd(tmux, session_name, cwd, inner):
+    """The `tmux new-session -d` argv that runs `inner` (a command argv) in `cwd`
+    under `session_name`. Single-sources the detached-session provisioning shape
+    shared by cmd_open (fresh --session-id) and cmd_attach (--resume): tmux runs
+    the window command through a shell, so `inner` is shlex-quoted into one string."""
+    return [tmux, "new-session", "-d", "-s", session_name, "-c", cwd,
+            " ".join(shlex.quote(a) for a in inner)]
 
 
-def cmd_attach(root, task_id, skip_permissions=False, claude_bin=None, execer=_exec_attach):
-    """Hand a worker's session over to a human at an interactive terminal.
+def _exec_tmux_attach(tmux, session_name):
+    """Replace this process with `tmux attach -t <session>` (drops the human into
+    the live claude session; like cmd_logs' tail-follow). Wrapped so tests can
+    inject a spy instead of exec."""
+    os.execvp(tmux, [tmux, "attach", "-t", session_name])
+
+
+def cmd_attach(root, task_id, skip_permissions=False, claude_bin=None,
+               runner=subprocess.run, which=shutil.which, execer=_exec_tmux_attach):
+    """Hand a worker's session over to a human, inside a tmux session they can detach.
 
     Stops the worker first (pause → confirm dead) so one session file isn't driven
-    by two processes at once, then execs `claude --resume <sid>` in the worktree.
-    Leaves the task queued+paused with no pid: `queued` keeps the supervisor's
-    stale detector (running-only) from relaunching a headless worker onto the live
-    session, `paused` blocks dispatch during the handover, and the pair lets a later
-    `td task resume` auto-continue via launch-worker.sh --resume (dispatch is
-    queued-only). The session id is preserved so that resume picks up where the
-    human left off."""
+    by two processes at once, then runs `claude --resume <sid>` in a detached tmux
+    session `td-<id>` in the worktree and attaches the human to it (mirrors cmd_open's
+    provisioning). Leaves the task queued+paused with no pid: `queued` keeps the
+    supervisor's stale detector (running-only) from relaunching a headless worker onto
+    the live session, `paused` blocks dispatch during the handover, and the pair lets a
+    later `td task resume` auto-continue via launch-worker.sh --resume (dispatch is
+    queued-only). The session id is preserved so resume picks up where the human left off.
+
+    Detaching (Ctrl-b d) leaves claude *alive* in the tmux session — a headless
+    `td task resume` would then put a second claude on the same session file. So the
+    handover message tells the human to END the tmux session (not just detach) before
+    resuming headless; we can't guard that here without reaching outside attach's scope."""
     root = _root(root)
     d = S.read(root, task_id)
     sid = d.get("worker_session_id")
@@ -233,6 +262,11 @@ def cmd_attach(root, task_id, skip_permissions=False, claude_bin=None, execer=_e
         print("td task attach: TOKENDANCE_CLAUDE unset — cannot locate the claude binary",
               file=sys.stderr)
         raise SystemExit(1)
+    tmux = which("tmux")
+    if not tmux:
+        print("td task attach: tmux not found on PATH — install tmux or resume headless via 'td task resume'",
+              file=sys.stderr)
+        raise SystemExit(1)
     # Safe takeover: block re-dispatch first, then stop the worker if it's still
     # alive (two processes on one session file corrupt/fork it). Dead worker → skip.
     S.update(root, task_id, {"paused": True})
@@ -241,14 +275,29 @@ def cmd_attach(root, task_id, skip_permissions=False, claude_bin=None, execer=_e
         _kill_worker(root, task_id)
     # State reconciliation (#5): out of `running` (no stale-relaunch), pid cleared.
     S.update(root, task_id, {"state": "queued", "worker_pid": None})
-    argv = [claude, "--resume", sid]
-    if skip_permissions:
-        argv.append("--dangerously-skip-permissions")
-    env = {**os.environ, "IS_SANDBOX": "1"}   # allow claude to boot as root
-    print(f"attaching to {task_id}: resuming session {sid[:8]} in {wt}\n"
-          f"worker stopped + paused; run 'td task resume {task_id}' after you exit "
-          f"to auto-continue headless.", file=sys.stderr)
-    execer(claude, argv, wt, env)
+    # Reuse an existing td-<id> session (e.g. from a prior open/attach) rather than
+    # letting new-session fail silently on the name clash; otherwise create it detached.
+    session_name = f"td-{task_id}"
+    exists = getattr(runner([tmux, "has-session", "-t", session_name],
+                            capture_output=True, text=True), "returncode", 1) == 0
+    if not exists:
+        inner = ["env", "IS_SANDBOX=1", claude, "--resume", sid]  # IS_SANDBOX → root boot
+        if skip_permissions:                     # default keeps interactive permission prompts
+            inner.append("--dangerously-skip-permissions")
+        res = runner(_tmux_new_session_cmd(tmux, session_name, wt, inner),
+                     capture_output=True, text=True)
+        if getattr(res, "returncode", 1) != 0:
+            print(f"td task attach: tmux failed to create session {session_name}:\n"
+                  f"{getattr(res, 'stderr', '') or ''}".rstrip(), file=sys.stderr)
+            raise SystemExit(1)
+    print(f"attaching to {task_id}: {'joining existing' if exists else 'resuming'} session "
+          f"{sid[:8]} in tmux {session_name} ({wt})\n"
+          f"  detach: Ctrl-b d  (claude keeps running in the background)\n"
+          f"  resume headless: END this tmux session first (exit claude / "
+          f"tmux kill-session -t {session_name}), then 'td task resume {task_id}' — a\n"
+          f"  still-detached session would collide with the headless worker on the same "
+          f"session file.", file=sys.stderr)
+    execer(tmux, session_name)
 
 
 def _recall_block(root, repo):
@@ -312,9 +361,8 @@ def _provision_session_worktree(root, repo, desc, task_id, cmd_name,
 def _tmux_launch(runner, tmux, session_name, wt, inner, cmd_name, task_id):
     """Start `inner` (an argv) in a detached tmux session `session_name` with its
     window cwd = worktree. Raises SystemExit if tmux fails. Shared by open/review."""
-    shell_cmd = " ".join(shlex.quote(a) for a in inner)   # tmux runs this via the shell
-    tmux_cmd = [tmux, "new-session", "-d", "-s", session_name, "-c", wt, shell_cmd]
-    res = runner(tmux_cmd, capture_output=True, text=True)
+    res = runner(_tmux_new_session_cmd(tmux, session_name, wt, inner),
+                 capture_output=True, text=True)
     if getattr(res, "returncode", 1) != 0:
         print(f"td {cmd_name}: tmux failed to create session {session_name} "
               f"(name in use? kill it or discard with 'td task abort {task_id}'):\n"
@@ -505,7 +553,7 @@ def main(argv=None):
     ab = task_sub.add_parser("abort", help="kill a worker; requeue (or --fail)")
     ab.add_argument("task_id")
     ab.add_argument("--fail", action="store_true", help="mark failed instead of requeue")
-    at = task_sub.add_parser("attach", help="stop a worker and take over its session interactively (claude --resume)")
+    at = task_sub.add_parser("attach", help="stop a worker and take over its session in tmux (claude --resume; detach with Ctrl-b d)")
     at.add_argument("task_id")
     at.add_argument("--skip-permissions", action="store_true",
                     help="pass --dangerously-skip-permissions (default: keep interactive permission prompts)")
@@ -533,6 +581,24 @@ def main(argv=None):
     rv.add_argument("--id", default=None)
     rv.add_argument("--skip-permissions", action="store_true",
                     help="pass --dangerously-skip-permissions (default: keep interactive permission prompts)")
+    bl = sub.add_parser("backlog", help="idea backlog: add, list, tag, promote to a task")
+    bl_sub = bl.add_subparsers(dest="bl_cmd", required=True)
+    bl_add = bl_sub.add_parser("add", help="add an idea to the backlog")
+    bl_add.add_argument("text")
+    bl_add.add_argument("--tag", action="append", default=[], dest="tags")
+    bl_ls = bl_sub.add_parser("ls", help="list backlog entries (filter by --tag / --status)")
+    bl_ls.add_argument("--tag", default=None)
+    bl_ls.add_argument("--status", choices=BL.STATUSES, default=None)
+    bl_show = bl_sub.add_parser("show", help="show a backlog entry in full")
+    bl_show.add_argument("id")
+    bl_tag = bl_sub.add_parser("tag", help="add tags to an entry (or --remove them)")
+    bl_tag.add_argument("id"); bl_tag.add_argument("tags", nargs="+")
+    bl_tag.add_argument("--remove", action="store_true")
+    bl_pr = bl_sub.add_parser("promote", help="promote an entry to a queued task for a repo")
+    bl_pr.add_argument("id"); bl_pr.add_argument("--repo", required=True)
+    bl_pr.add_argument("--id", dest="task_id", default=None)
+    bl_drop = bl_sub.add_parser("drop", help="mark an entry dropped")
+    bl_drop.add_argument("id")
     help_p = sub.add_parser("help", help="show help, optionally for a command")
     help_p.add_argument("topic", nargs="?")
     args = ap.parse_args(argv)
@@ -546,9 +612,9 @@ def main(argv=None):
     root = _root(args.root)
     if args.cmd == "task":
         if args.task_cmd == "ls":
-            print(f"{'ID':24} {'STATE':12} {'HB':8} {'ATT':4} FLAG")
-            for tid, st, age, att, flag in cmd_status(root):
-                print(f"{tid:24} {st:12} {age:8} {att:4} {flag}")
+            print(f"{'ID':24} {'STATE':12} {'HB':8} {'ATT':4} {'FLAG':8} WORKTREE")
+            for tid, st, age, att, flag, wt in cmd_status(root):
+                print(f"{tid:24} {st:12} {age:8} {att:4} {flag:8} {wt or '-'}")
         elif args.task_cmd == "peek":
             print(cmd_peek(root, args.task_id, log_lines=args.n))
         elif args.task_cmd == "logs":
@@ -600,6 +666,41 @@ def main(argv=None):
             for a in acts:
                 print(f"{a['name']}\t{a['reason']}\t{a.get('freed_bytes', 0)}")
             print(f"FREED\t{freed}")
+    elif args.cmd == "backlog":
+        if args.bl_cmd == "add":
+            print(BL.add(root, args.text, args.tags))
+        elif args.bl_cmd == "ls":
+            print(f"{'ID':40} {'STATUS':9} {'AGE':5} {'TAGS':16} TEXT")
+            for e in BL.ls(root, tag=args.tag, status=args.status):
+                first = (e.get("text") or "").strip().splitlines()
+                print(f"{e['id']:40} {e['status']:9} {_age(e.get('created')):5} "
+                      f"{','.join(e.get('tags', [])):16} {(first[0] if first else '')[:60]}")
+        elif args.bl_cmd == "show":
+            try:
+                e = BL.get(root, args.id)
+            except ValueError as err:
+                print(f"td backlog show: {err}", file=sys.stderr); raise SystemExit(1)
+            print(f"id:        {e['id']}")
+            print(f"created:   {e.get('created', '')}")
+            print(f"status:    {e.get('status', '')}")
+            print(f"tags:      {', '.join(e.get('tags', []))}")
+            print(f"promoted:  {e.get('promoted_task_id') or '-'}")
+            print(f"\n{e.get('text', '')}")
+        elif args.bl_cmd == "tag":
+            try:
+                BL.tag(root, args.id, args.tags, remove=args.remove)
+            except ValueError as err:
+                print(f"td backlog tag: {err}", file=sys.stderr); raise SystemExit(1)
+        elif args.bl_cmd == "promote":
+            try:
+                print(BL.promote(root, args.id, args.repo, task_id=args.task_id))
+            except ValueError as err:
+                print(f"td backlog promote: {err}", file=sys.stderr); raise SystemExit(1)
+        elif args.bl_cmd == "drop":
+            try:
+                BL.drop(root, args.id)
+            except ValueError as err:
+                print(f"td backlog drop: {err}", file=sys.stderr); raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -40,6 +40,15 @@ class ReadCommandsTest(unittest.TestCase):
         self.assertIn("t1", ids)
         self.assertEqual(ids["t1"][1], "running")
 
+    def test_status_reports_worktree_path_or_none(self):
+        TK.create_task(self.tmp, "t1", title="A", repo="/r")   # leased
+        TK.create_task(self.tmp, "t2", title="B", repo="/r")   # never leased
+        with open(os.path.join(S.task_dir(self.tmp, "t1"), "worktree.path"), "w") as f:
+            f.write("/leased/wt/t1\n")
+        rows = {r[0]: r for r in td.cmd_status(self.tmp)}
+        self.assertEqual(rows["t1"][5], "/leased/wt/t1")  # recorded → abs path (last column)
+        self.assertIsNone(rows["t2"][5])                  # unrecorded → None (rendered as -)
+
     def test_peek_shows_progress_and_pending_steer_without_consuming(self):
         TK.create_task(self.tmp, "t1", repo="/r")
         td_dir = S.task_dir(self.tmp, "t1")
@@ -212,48 +221,108 @@ class AttachTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _spy_execer(self):
+    def _spies(self, session_exists=False):
+        """Spy runner (records tmux argv; reports has-session existence) + spy execer
+        (records the final `tmux attach`). No real tmux/exec — pure injection."""
         calls = []
-        def execer(claude, argv, cwd, env):
-            calls.append({"claude": claude, "argv": argv, "cwd": cwd, "env": env})
-        return calls, execer
+
+        def runner(cmd, **k):
+            calls.append(cmd)
+            if "has-session" in cmd:
+                return types.SimpleNamespace(
+                    returncode=0 if session_exists else 1, stdout="", stderr="")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        attached = []
+
+        def execer(tmux, session_name):
+            attached.append({"tmux": tmux, "session": session_name})
+
+        return calls, runner, attached, execer
+
+    def _new_session_call(self, calls):
+        hits = [c for c in calls if any("new-session" in str(x) for x in c)]
+        return hits[0] if hits else None
 
     def test_attach_errors_when_no_session(self):
         S.update(self.tmp, "t1", {"worker_session_id": None})
-        calls, execer = self._spy_execer()
+        calls, runner, attached, execer = self._spies()
         with self.assertRaises(SystemExit) as ctx:
-            td.cmd_attach(self.tmp, "t1", claude_bin="/fake/claude", execer=execer)
+            td.cmd_attach(self.tmp, "t1", claude_bin="/fake/claude",
+                          runner=runner, which=lambda _: "/fake/tmux", execer=execer)
         self.assertNotEqual(ctx.exception.code, 0)   # non-zero exit
-        self.assertEqual(calls, [])                  # never hands over
+        self.assertEqual(calls, [])                  # never provisions
+        self.assertEqual(attached, [])               # never attaches
 
     def test_attach_errors_when_no_worktree(self):
         os.remove(os.path.join(S.task_dir(self.tmp, "t1"), "worktree.path"))
-        calls, execer = self._spy_execer()
+        calls, runner, attached, execer = self._spies()
         with self.assertRaises(SystemExit):
-            td.cmd_attach(self.tmp, "t1", claude_bin="/fake/claude", execer=execer)
-        self.assertEqual(calls, [])
+            td.cmd_attach(self.tmp, "t1", claude_bin="/fake/claude",
+                          runner=runner, which=lambda _: "/fake/tmux", execer=execer)
+        self.assertEqual(attached, [])
 
-    def test_attach_live_worker_pauses_kills_then_resumes(self):
+    def test_attach_errors_when_tmux_missing_and_leaves_state_untouched(self):
+        calls, runner, attached, execer = self._spies()
+        with self.assertRaises(SystemExit) as ctx:
+            td.cmd_attach(self.tmp, "t1", claude_bin="/fake/claude",
+                          runner=runner, which=lambda _: None, execer=execer)
+        self.assertNotEqual(ctx.exception.code, 0)
+        self.assertEqual(calls, [])                  # no tmux command ran
+        self.assertEqual(attached, [])
+        d = S.read(self.tmp, "t1")                    # errored before the takeover mutation
+        self.assertEqual(d["state"], "running")
+        self.assertFalse(d.get("paused"))
+
+    def test_attach_live_worker_pauses_kills_then_provisions_and_attaches(self):
         pid = _spawn_orphan(["sleep", "30"])
         S.update(self.tmp, "t1", {"worker_pid": pid})
         self.addCleanup(lambda: (os.kill(pid, 9) if td._alive(pid) else None))
-        calls, execer = self._spy_execer()
-        td.cmd_attach(self.tmp, "t1", claude_bin="/fake/claude", execer=execer)
+        calls, runner, attached, execer = self._spies()
+        td.cmd_attach(self.tmp, "t1", claude_bin="/fake/claude",
+                      runner=runner, which=lambda _: "/fake/tmux", execer=execer)
         self.assertFalse(td._alive(pid))             # worker stopped before handover
         d = S.read(self.tmp, "t1")
         self.assertEqual(d["state"], "queued")       # out of running (no stale-relaunch)
         self.assertTrue(d["paused"])                 # dispatch blocked during handover
         self.assertIsNone(d["worker_pid"])           # dead pid cleared
         self.assertEqual(d["worker_session_id"], "SID-123")  # session preserved for resume
-        self.assertEqual(len(calls), 1)
-        c = calls[0]
-        self.assertEqual(c["claude"], "/fake/claude")
-        self.assertEqual(c["cwd"], self.wt)          # cwd = worktree
-        self.assertEqual(c["argv"][:3], ["/fake/claude", "--resume", "SID-123"])
-        self.assertEqual(c["env"]["IS_SANDBOX"], "1")
-        self.assertNotIn("--dangerously-skip-permissions", c["argv"])  # default keeps prompts
 
-    def test_attach_dead_worker_skips_kill_and_resumes(self):
+    def test_attach_tmux_new_session_has_resume_cwd_and_env(self):
+        S.update(self.tmp, "t1", {"worker_pid": None})   # no live worker
+        calls, runner, attached, execer = self._spies()
+        td.cmd_attach(self.tmp, "t1", claude_bin="/fake/claude",
+                      runner=runner, which=lambda _: "/fake/tmux", execer=execer)
+        tmux = self._new_session_call(calls)
+        self.assertIsNotNone(tmux)                   # created (session didn't exist)
+        self.assertEqual(tmux[0], "/fake/tmux")
+        self.assertIn("new-session", tmux)
+        self.assertIn("-d", tmux)                    # detached
+        self.assertIn("td-t1", tmux)                 # session name = td-<id>
+        self.assertEqual(tmux[tmux.index("-c") + 1], self.wt)  # window cwd = worktree
+        shell_cmd = tmux[-1]
+        self.assertIn("IS_SANDBOX=1", shell_cmd)     # root boot
+        self.assertIn("/fake/claude", shell_cmd)
+        self.assertIn("--resume", shell_cmd)
+        self.assertIn("SID-123", shell_cmd)          # resumes the preserved session id
+        self.assertNotIn("--dangerously-skip-permissions", shell_cmd)  # default keeps prompts
+
+    def test_attach_execs_tmux_attach_to_session(self):
+        S.update(self.tmp, "t1", {"worker_pid": None})
+        calls, runner, attached, execer = self._spies()
+        td.cmd_attach(self.tmp, "t1", claude_bin="/fake/claude",
+                      runner=runner, which=lambda _: "/fake/tmux", execer=execer)
+        self.assertEqual(attached, [{"tmux": "/fake/tmux", "session": "td-t1"}])
+
+    def test_attach_reuses_existing_session_without_new_session(self):
+        S.update(self.tmp, "t1", {"worker_pid": None})
+        calls, runner, attached, execer = self._spies(session_exists=True)
+        td.cmd_attach(self.tmp, "t1", claude_bin="/fake/claude",
+                      runner=runner, which=lambda _: "/fake/tmux", execer=execer)
+        self.assertIsNone(self._new_session_call(calls))   # no duplicate new-session
+        self.assertEqual(attached, [{"tmux": "/fake/tmux", "session": "td-t1"}])  # still attaches
+
+    def test_attach_dead_worker_skips_kill(self):
         pid = _spawn_orphan(["sleep", "30"])
         os.kill(pid, 9)
         td._wait_dead(pid, 2.0)
@@ -263,10 +332,11 @@ class AttachTest(unittest.TestCase):
         orig = td._kill_worker
         td._kill_worker = lambda *a, **k: killed.append(True)
         self.addCleanup(lambda: setattr(td, "_kill_worker", orig))
-        calls, execer = self._spy_execer()
-        td.cmd_attach(self.tmp, "t1", claude_bin="/fake/claude", execer=execer)
+        calls, runner, attached, execer = self._spies()
+        td.cmd_attach(self.tmp, "t1", claude_bin="/fake/claude",
+                      runner=runner, which=lambda _: "/fake/tmux", execer=execer)
         self.assertEqual(killed, [])                 # dead worker → kill skipped
-        self.assertEqual(len(calls), 1)              # went straight to resume
+        self.assertEqual(len(attached), 1)           # went straight to attach
         d = S.read(self.tmp, "t1")
         self.assertEqual(d["state"], "queued")
         self.assertTrue(d["paused"])
@@ -274,10 +344,10 @@ class AttachTest(unittest.TestCase):
 
     def test_attach_skip_permissions_adds_flag(self):
         S.update(self.tmp, "t1", {"worker_pid": None})   # no live worker
-        calls, execer = self._spy_execer()
-        td.cmd_attach(self.tmp, "t1", skip_permissions=True,
-                      claude_bin="/fake/claude", execer=execer)
-        self.assertIn("--dangerously-skip-permissions", calls[0]["argv"])
+        calls, runner, attached, execer = self._spies()
+        td.cmd_attach(self.tmp, "t1", skip_permissions=True, claude_bin="/fake/claude",
+                      runner=runner, which=lambda _: "/fake/tmux", execer=execer)
+        self.assertIn("--dangerously-skip-permissions", self._new_session_call(calls)[-1])
 
 
 class SpawnTest(unittest.TestCase):
@@ -723,6 +793,10 @@ class HelpTest(unittest.TestCase):
         self.assertIn("usage: td task", out)
         self.assertIn("spawn", out)
 
+    def test_help_task_attach_reflects_tmux(self):
+        out = self._run(["help", "task"])
+        self.assertIn("tmux", out)   # attach help now advertises the tmux takeover
+
 
 class WorktreeDispatchTest(unittest.TestCase):
     def setUp(self):
@@ -775,6 +849,16 @@ class TaskNamespaceTest(unittest.TestCase):
         out = self._run(["task", "ls"])
         self.assertIn("t1", out)
 
+    def test_task_ls_shows_worktree_path_column(self):
+        with open(os.path.join(S.task_dir(self.tmp, "t1"), "worktree.path"), "w") as f:
+            f.write("/leased/wt/t1\n")
+        TK.create_task(self.tmp, "t2", repo=self.repo)   # no worktree.path
+        out = self._run(["task", "ls"])
+        self.assertIn("WORKTREE", out)                   # header column added
+        self.assertIn("/leased/wt/t1", out)              # (a) leased task shows its path
+        t2_line = next(ln for ln in out.splitlines() if ln.startswith("t2 "))
+        self.assertTrue(t2_line.rstrip().endswith("-"))  # (b) unleased task shows -
+
     def test_task_spawn_creates_queued_task(self):
         out = self._run(["task", "spawn", "--repo", self.repo, "desc"])
         self.assertTrue(out.strip())
@@ -791,4 +875,77 @@ class TaskNamespaceTest(unittest.TestCase):
             td.main(["help"])
         out = buf.getvalue()
         for c in ("task", "worktree", "peek", "steer", "spawn", "disk", "gc"):
+            self.assertIn(c, out)
+
+
+class BacklogCmdTest(unittest.TestCase):
+    """`td backlog` — idea backlog group over scripts/backlog.py."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, argv):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            td.main(["--root", self.tmp, *argv])  # must NOT raise
+        return buf.getvalue()
+
+    def test_add_prints_id_and_ls_shows_entry(self):
+        eid = self._run(["backlog", "add", "cache the compile graph", "--tag", "perf"]).strip()
+        self.assertTrue(eid)
+        out = self._run(["backlog", "ls"])
+        self.assertIn(eid, out)
+        self.assertIn("cache the compile graph", out)
+        self.assertIn("perf", out)
+
+    def test_ls_status_filter(self):
+        eid = self._run(["backlog", "add", "x"]).strip()
+        self._run(["backlog", "drop", eid])
+        self.assertIn(eid, self._run(["backlog", "ls", "--status", "dropped"]))
+        self.assertNotIn(eid, self._run(["backlog", "ls", "--status", "open"]))
+
+    def test_show_displays_text(self):
+        eid = self._run(["backlog", "add", "showable idea"]).strip()
+        self.assertIn("showable idea", self._run(["backlog", "show", eid]))
+
+    def test_tag_add_and_remove(self):
+        import backlog as BL
+        eid = self._run(["backlog", "add", "y"]).strip()
+        self._run(["backlog", "tag", eid, "alpha", "beta"])
+        self.assertEqual(BL.get(self.tmp, eid)["tags"], ["alpha", "beta"])
+        self._run(["backlog", "tag", eid, "alpha", "--remove"])
+        self.assertEqual(BL.get(self.tmp, eid)["tags"], ["beta"])
+
+    def test_promote_creates_task_and_marks_entry(self):
+        import backlog as BL
+        eid = self._run(["backlog", "add", "promote me", "--tag", "z"]).strip()
+        tid = self._run(["backlog", "promote", eid, "--repo", "/repos/x", "--id", "bp-task"]).strip()
+        self.assertEqual(tid, "bp-task")
+        self.assertEqual(S.read(self.tmp, "bp-task")["state"], "queued")
+        e = BL.get(self.tmp, eid)
+        self.assertEqual(e["status"], "promoted")
+        self.assertEqual(e["promoted_task_id"], "bp-task")
+
+    def test_round_trip_via_main(self):
+        import backlog as BL
+        eid = self._run(["backlog", "add", "rt idea", "--tag", "a"]).strip()
+        self.assertIn(eid, self._run(["backlog", "ls", "--tag", "a"]))
+        self._run(["backlog", "tag", eid, "b"])
+        self.assertIn("rt idea", self._run(["backlog", "show", eid]))
+        tid = self._run(["backlog", "promote", eid, "--repo", "/r", "--id", "rt"]).strip()
+        self.assertEqual(tid, "rt")
+        self.assertEqual(BL.get(self.tmp, eid)["status"], "promoted")
+
+    def test_help_tree_includes_backlog_group_and_subcommands(self):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            td.main(["help"])
+        out = buf.getvalue()
+        self.assertIn("backlog", out)
+        for c in ("promote", "drop"):        # subcommands unique to backlog
             self.assertIn(c, out)
