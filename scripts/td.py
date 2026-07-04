@@ -262,6 +262,66 @@ def _recall_block(root, repo):
         return ""
 
 
+DEFAULT_REVIEW_REPO = "/root/npu-tools"   # `td review` default target repo
+
+
+def _provision_session_worktree(root, repo, desc, task_id, cmd_name,
+                                runner, which, claude_bin):
+    """Shared prologue for `open`/`review`: locate the claude binary + tmux, create
+    the tracked task (paused up front so dispatch can't grab it before the worktree
+    and session exist), lease an isolated worktree via prepare-worktree.sh, and mint
+    + record a fresh session id (worker_pid stays None). Returns
+    (task_id, wt, sid, claude, tmux) or raises SystemExit on any missing prerequisite.
+    `cmd_name` only tunes the `td <cmd_name>:` error-message prefix."""
+    claude = claude_bin or os.environ.get("TOKENDANCE_CLAUDE")
+    if not claude:
+        print(f"td {cmd_name}: TOKENDANCE_CLAUDE unset — cannot locate the claude binary",
+              file=sys.stderr)
+        raise SystemExit(1)
+    tmux = which("tmux")
+    if not tmux:
+        print(f"td {cmd_name}: tmux not found on PATH — install tmux or run headless via 'td task spawn'",
+              file=sys.stderr)
+        raise SystemExit(1)
+    # Create the tracked task (reuses spawn's id rule + status scaffolding), then
+    # pause immediately so dispatch can't grab it before the worktree/session exist.
+    task_id = cmd_spawn(root, repo, desc, task_id=task_id)
+    S.update(root, task_id, {"paused": True})
+    # Provision the isolated worktree (pool lease + branch tokendance/<id> + records
+    # worktree.path). Pass root through so prepare-worktree resolves the same tree.
+    prep = runner(["bash", _script(root, "prepare-worktree.sh"), task_id],
+                  capture_output=True, text=True,
+                  env={**os.environ, "TOKENDANCE_ROOT": root})
+    if getattr(prep, "returncode", 1) != 0:
+        print(f"td {cmd_name}: worktree provisioning failed for {task_id} "
+              f"(discard with 'td task abort {task_id}'):\n{getattr(prep, 'stderr', '') or ''}".rstrip(),
+              file=sys.stderr)
+        raise SystemExit(1)
+    wt = _worktree_path(root, task_id)
+    if not wt or not os.path.isdir(wt):
+        print(f"td {cmd_name}: no worktree recorded for {task_id} ({wt or 'unrecorded'}) "
+              f"— discard with 'td task abort {task_id}'", file=sys.stderr)
+        raise SystemExit(1)
+    # Mint the session up front (like launch-worker) and record it; worker_pid stays
+    # None (init default). resume tolerates a missing session file → clean fresh boot.
+    sid = str(uuid.uuid4())
+    S.update(root, task_id, {"worker_session_id": sid})
+    return task_id, wt, sid, claude, tmux
+
+
+def _tmux_launch(runner, tmux, session_name, wt, inner, cmd_name, task_id):
+    """Start `inner` (an argv) in a detached tmux session `session_name` with its
+    window cwd = worktree. Raises SystemExit if tmux fails. Shared by open/review."""
+    shell_cmd = " ".join(shlex.quote(a) for a in inner)   # tmux runs this via the shell
+    tmux_cmd = [tmux, "new-session", "-d", "-s", session_name, "-c", wt, shell_cmd]
+    res = runner(tmux_cmd, capture_output=True, text=True)
+    if getattr(res, "returncode", 1) != 0:
+        print(f"td {cmd_name}: tmux failed to create session {session_name} "
+              f"(name in use? kill it or discard with 'td task abort {task_id}'):\n"
+              f"{getattr(res, 'stderr', '') or ''}".rstrip(), file=sys.stderr)
+        raise SystemExit(1)
+
+
 def cmd_open(root, repo, desc="", task_id=None, skip_permissions=False,
              claude_bin=None, runner=subprocess.run, which=shutil.which,
              recall_fn=_recall_block):
@@ -279,39 +339,8 @@ def cmd_open(root, repo, desc="", task_id=None, skip_permissions=False,
     and the pair lets a later `td task resume` offload the work headless via
     launch-worker.sh --resume (dispatch is queued-only), reusing the same session."""
     root = _root(root)
-    claude = claude_bin or os.environ.get("TOKENDANCE_CLAUDE")
-    if not claude:
-        print("td task open: TOKENDANCE_CLAUDE unset — cannot locate the claude binary",
-              file=sys.stderr)
-        raise SystemExit(1)
-    tmux = which("tmux")
-    if not tmux:
-        print("td task open: tmux not found on PATH — install tmux or run headless via 'td task spawn'",
-              file=sys.stderr)
-        raise SystemExit(1)
-    # Create the tracked task (reuses spawn's id rule + status scaffolding), then
-    # pause immediately so dispatch can't grab it before the worktree/session exist.
-    task_id = cmd_spawn(root, repo, desc, task_id=task_id)
-    S.update(root, task_id, {"paused": True})
-    # Provision the isolated worktree (pool lease + branch tokendance/<id> + records
-    # worktree.path). Pass root through so prepare-worktree resolves the same tree.
-    prep = runner(["bash", _script(root, "prepare-worktree.sh"), task_id],
-                  capture_output=True, text=True,
-                  env={**os.environ, "TOKENDANCE_ROOT": root})
-    if getattr(prep, "returncode", 1) != 0:
-        print(f"td task open: worktree provisioning failed for {task_id} "
-              f"(discard with 'td task abort {task_id}'):\n{getattr(prep, 'stderr', '') or ''}".rstrip(),
-              file=sys.stderr)
-        raise SystemExit(1)
-    wt = _worktree_path(root, task_id)
-    if not wt or not os.path.isdir(wt):
-        print(f"td task open: no worktree recorded for {task_id} ({wt or 'unrecorded'}) "
-              f"— discard with 'td task abort {task_id}'", file=sys.stderr)
-        raise SystemExit(1)
-    # Mint the session up front (like launch-worker) and record it; worker_pid stays
-    # None (init default). resume tolerates a missing session file → clean fresh boot.
-    sid = str(uuid.uuid4())
-    S.update(root, task_id, {"worker_session_id": sid})
+    task_id, wt, sid, claude, tmux = _provision_session_worktree(
+        root, repo, desc, task_id, "task open", runner, which, claude_bin)
     recall = recall_fn(root, repo)
     inner = ["env", "IS_SANDBOX=1", claude, "--session-id", sid]
     if recall:                                    # empty recall → omit the flag entirely
@@ -319,15 +348,72 @@ def cmd_open(root, repo, desc="", task_id=None, skip_permissions=False,
     if skip_permissions:                          # default keeps interactive permission prompts
         inner.append("--dangerously-skip-permissions")
     session_name = f"td-{task_id}"
-    shell_cmd = " ".join(shlex.quote(a) for a in inner)   # tmux runs this via the shell
-    tmux_cmd = [tmux, "new-session", "-d", "-s", session_name, "-c", wt, shell_cmd]
-    res = runner(tmux_cmd, capture_output=True, text=True)
-    if getattr(res, "returncode", 1) != 0:
-        print(f"td task open: tmux failed to create session {session_name} "
-              f"(name in use? kill it or discard with 'td task abort {task_id}'):\n"
-              f"{getattr(res, 'stderr', '') or ''}".rstrip(), file=sys.stderr)
-        raise SystemExit(1)
+    _tmux_launch(runner, tmux, session_name, wt, inner, "task open", task_id)
     print(f"opened {task_id}: human-driven session {session_name} (detached) in {wt}\n"
+          f"  attach:  tmux attach -t {session_name}\n"
+          f"  offload: td task resume {task_id}   (hand off to a headless worker)\n"
+          f"  reclaim: td task abort {task_id}    (discard worktree when done)",
+          file=sys.stderr)
+    return task_id
+
+
+def cmd_review(root, n, repo=DEFAULT_REVIEW_REPO, task_id=None, skip_permissions=False,
+               claude_bin=None, runner=subprocess.run, which=shutil.which,
+               recall_fn=_recall_block):
+    """Provision a one-shot PR-review session — cmd_open's forward extension.
+
+    Beyond open's [worktree + detached tmux `td-<id>`, queued+paused], review adds
+    two steps so a human attaching sees a finished review immediately: it checks the
+    PR head out into the worktree, and primes the session headless by running
+    `/rust-review <n>` before the tmux window is created (which then `--resume`s the
+    already-populated session). The headless `-p "/rust-review <n>"` genuinely runs
+    the slash skill (verified); its only extra runtime need is `gh`/network for the
+    PR fetch, so a prime failure is non-fatal — the session still opens for a manual
+    review. End state matches open (queued+paused, no pid, session recorded) so the
+    same attach/offload/reclaim lifecycle applies."""
+    root = _root(root)
+    if task_id is None:
+        task_id = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%S}-review-pr{n}"
+    task_id, wt, sid, claude, tmux = _provision_session_worktree(
+        root, repo, f"review PR #{n}", task_id, "review", runner, which, claude_bin)
+    # Check the PR head out into the worktree (detached; leaves branch tokendance/<id>
+    # intact so reclaim still works). Fetch then checkout, hard-failing on either.
+    fetch = runner(["git", "-C", wt, "fetch", "origin", f"pull/{n}/head"],
+                   capture_output=True, text=True)
+    if getattr(fetch, "returncode", 1) != 0:
+        print(f"td review: failed to fetch pull/{n}/head into {wt} "
+              f"(discard with 'td task abort {task_id}'):\n{getattr(fetch, 'stderr', '') or ''}".rstrip(),
+              file=sys.stderr)
+        raise SystemExit(1)
+    co = runner(["git", "-C", wt, "checkout", "--detach", "FETCH_HEAD"],
+                capture_output=True, text=True)
+    if getattr(co, "returncode", 1) != 0:
+        print(f"td review: failed to check out PR #{n} in {wt} "
+              f"(discard with 'td task abort {task_id}'):\n{getattr(co, 'stderr', '') or ''}".rstrip(),
+              file=sys.stderr)
+        raise SystemExit(1)
+    recall = recall_fn(root, repo)
+    # Prime the session headless: run /rust-review in the worktree so the transcript
+    # is pre-filled before the human takes over. Best-effort — gh/network may fail.
+    prime = ["env", "IS_SANDBOX=1", claude, "--session-id", sid, "-p", f"/rust-review {n}"]
+    if recall:
+        prime += ["--append-system-prompt", recall]
+    if skip_permissions:
+        prime.append("--dangerously-skip-permissions")
+    pr = runner(prime, cwd=wt, capture_output=True, text=True)
+    if getattr(pr, "returncode", 1) != 0:
+        print(f"td review: headless /rust-review prime failed for {task_id} "
+              f"(session opens anyway; run '/rust-review {n}' after attaching):\n"
+              f"{getattr(pr, 'stderr', '') or ''}".rstrip(), file=sys.stderr)
+    # Resume the primed session in a detached tmux (like attach, resume carries no
+    # recall — the prime already appended it). skip_permissions matches the prime.
+    session_name = f"td-{task_id}"
+    inner = ["env", "IS_SANDBOX=1", claude, "--resume", sid]
+    if skip_permissions:
+        inner.append("--dangerously-skip-permissions")
+    _tmux_launch(runner, tmux, session_name, wt, inner, "review", task_id)
+    print(f"review {task_id}: PR #{n} checked out + /rust-review primed; "
+          f"session {session_name} (detached) in {wt}\n"
           f"  attach:  tmux attach -t {session_name}\n"
           f"  offload: td task resume {task_id}   (hand off to a headless worker)\n"
           f"  reclaim: td task abort {task_id}    (discard worktree when done)",
@@ -441,6 +527,12 @@ def main(argv=None):
     wt_gc = wt_sub.add_parser("gc", help="reclaim idle/oversized pool target/ dirs (--dry-run to preview)")
     wt_gc.add_argument("--repo", default=None)
     wt_gc.add_argument("--dry-run", action="store_true")
+    rv = sub.add_parser("review", help="provision a PR-review session (PR checkout + /rust-review primed + tmux)")
+    rv.add_argument("n", type=int, help="GitHub PR number")
+    rv.add_argument("--repo", default=DEFAULT_REVIEW_REPO, help="target repo (default: %(default)s)")
+    rv.add_argument("--id", default=None)
+    rv.add_argument("--skip-permissions", action="store_true",
+                    help="pass --dangerously-skip-permissions (default: keep interactive permission prompts)")
     help_p = sub.add_parser("help", help="show help, optionally for a command")
     help_p.add_argument("topic", nargs="?")
     args = ap.parse_args(argv)
@@ -486,6 +578,12 @@ def main(argv=None):
                                skip_permissions=args.skip_permissions))
             except ValueError as e:
                 print(f"td task open: {e}", file=sys.stderr); raise SystemExit(1)
+    elif args.cmd == "review":
+        try:
+            print(cmd_review(root, args.n, repo=args.repo, task_id=args.id,
+                             skip_permissions=args.skip_permissions))
+        except ValueError as e:
+            print(f"td review: {e}", file=sys.stderr); raise SystemExit(1)
     elif args.cmd == "worktree":
         if args.wt_cmd == "ls":
             print(f"{'REPO':20} {'SLOT':5} {'STATE':7} {'HOLDER':25} {'TARGET':>8} PATH")
