@@ -17,6 +17,11 @@
 - 변경은 cwd(타겟 레포 worktree)의 브랜치 `tokendance/<id>` 에서. 어떤 레포든 main 직접 push 금지.
 - **아티팩트는 재사용된다 — 새로 받지 마라.** 레포가 `.tokendance-worktree.manifest`/`.tokendance-worktree.env` 를 두면 무거운 아티팩트(libtorch 등)가 메인 체크아웃에서 symlink/env 로 자동 제공된다. 예) npu-tools: `LIBTORCH` 가 이미 주입돼 있으니 `dvc pull` 이나 수동 `export LIBTORCH=...` 하지 말고 그대로 빌드/테스트하라(`echo $LIBTORCH` 로 확인).
 
+## 작업 방식 (항상 superpowers 스킬 사용)
+- 모든 일감에서 **먼저 작업 성격에 맞는 superpowers 스킬을 `Skill` 툴로 발동**하고 그 워크플로를 따라라. 스킬은 흔한 실수를 막는 검증된 절차다 — 즉흥적으로 진행하지 마라.
+- 예시: 기능/버그 구현은 `brainstorming` → `test-driven-development`, 버그 추적은 `systematic-debugging`, 완료 주장 전에는 `verification-before-completion`.
+- 스킬 워크플로가 명백히 과할 때(예: 문서 한 줄 수정)에 한해, **task.md 가 명시적으로 면제**하면 생략할 수 있다.
+
 ## 진행 (각 의미 있는 단계 경계마다)
 1. `$TOKENDANCE_ROOT/state/tasks/<id>/progress.md` 갱신: 현재 단계 / 하는 일 / 애매한 점 / 한 가정 / 자체점검.
 2. `python3 $TOKENDANCE_ROOT/scripts/checkpoint.py <id>` 실행 → heartbeat 갱신 + 새 steer 를 출력한다. 출력이 있으면 반영하고 `$TOKENDANCE_ROOT/state/tasks/<id>/progress.md` 에 반영 사실을 남긴다.
