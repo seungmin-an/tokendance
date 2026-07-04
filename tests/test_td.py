@@ -580,3 +580,76 @@ class TaskNamespaceTest(unittest.TestCase):
         out = buf.getvalue()
         for c in ("task", "worktree", "peek", "steer", "spawn", "disk", "gc"):
             self.assertIn(c, out)
+
+
+class BacklogCmdTest(unittest.TestCase):
+    """`td backlog` — idea backlog group over scripts/backlog.py."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, argv):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            td.main(["--root", self.tmp, *argv])  # must NOT raise
+        return buf.getvalue()
+
+    def test_add_prints_id_and_ls_shows_entry(self):
+        eid = self._run(["backlog", "add", "cache the compile graph", "--tag", "perf"]).strip()
+        self.assertTrue(eid)
+        out = self._run(["backlog", "ls"])
+        self.assertIn(eid, out)
+        self.assertIn("cache the compile graph", out)
+        self.assertIn("perf", out)
+
+    def test_ls_status_filter(self):
+        eid = self._run(["backlog", "add", "x"]).strip()
+        self._run(["backlog", "drop", eid])
+        self.assertIn(eid, self._run(["backlog", "ls", "--status", "dropped"]))
+        self.assertNotIn(eid, self._run(["backlog", "ls", "--status", "open"]))
+
+    def test_show_displays_text(self):
+        eid = self._run(["backlog", "add", "showable idea"]).strip()
+        self.assertIn("showable idea", self._run(["backlog", "show", eid]))
+
+    def test_tag_add_and_remove(self):
+        import backlog as BL
+        eid = self._run(["backlog", "add", "y"]).strip()
+        self._run(["backlog", "tag", eid, "alpha", "beta"])
+        self.assertEqual(BL.get(self.tmp, eid)["tags"], ["alpha", "beta"])
+        self._run(["backlog", "tag", eid, "alpha", "--remove"])
+        self.assertEqual(BL.get(self.tmp, eid)["tags"], ["beta"])
+
+    def test_promote_creates_task_and_marks_entry(self):
+        import backlog as BL
+        eid = self._run(["backlog", "add", "promote me", "--tag", "z"]).strip()
+        tid = self._run(["backlog", "promote", eid, "--repo", "/repos/x", "--id", "bp-task"]).strip()
+        self.assertEqual(tid, "bp-task")
+        self.assertEqual(S.read(self.tmp, "bp-task")["state"], "queued")
+        e = BL.get(self.tmp, eid)
+        self.assertEqual(e["status"], "promoted")
+        self.assertEqual(e["promoted_task_id"], "bp-task")
+
+    def test_round_trip_via_main(self):
+        import backlog as BL
+        eid = self._run(["backlog", "add", "rt idea", "--tag", "a"]).strip()
+        self.assertIn(eid, self._run(["backlog", "ls", "--tag", "a"]))
+        self._run(["backlog", "tag", eid, "b"])
+        self.assertIn("rt idea", self._run(["backlog", "show", eid]))
+        tid = self._run(["backlog", "promote", eid, "--repo", "/r", "--id", "rt"]).strip()
+        self.assertEqual(tid, "rt")
+        self.assertEqual(BL.get(self.tmp, eid)["status"], "promoted")
+
+    def test_help_tree_includes_backlog_group_and_subcommands(self):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            td.main(["help"])
+        out = buf.getvalue()
+        self.assertIn("backlog", out)
+        for c in ("promote", "drop"):        # subcommands unique to backlog
+            self.assertIn(c, out)

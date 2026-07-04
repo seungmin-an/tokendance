@@ -19,6 +19,7 @@ import tasks as TK
 import config
 import pool
 import checkpoint as CP
+import backlog as BL
 
 
 def _root(root=None):
@@ -38,6 +39,18 @@ def _hb_age(hb, now=None):
     except (TypeError, ValueError):
         return None
     return (now if now is not None else time.time()) - t
+
+
+def _age(iso, now=None):
+    """Compact human age (3d/5h/2m/10s) from an ISO-UTC timestamp; '-' if unparseable."""
+    secs = _hb_age(iso, now)
+    if secs is None:
+        return "-"
+    secs = int(secs)
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= size:
+            return f"{secs // size}{unit}"
+    return f"{secs}s"
 
 
 def _read(p):
@@ -441,6 +454,24 @@ def main(argv=None):
     wt_gc = wt_sub.add_parser("gc", help="reclaim idle/oversized pool target/ dirs (--dry-run to preview)")
     wt_gc.add_argument("--repo", default=None)
     wt_gc.add_argument("--dry-run", action="store_true")
+    bl = sub.add_parser("backlog", help="idea backlog: add, list, tag, promote to a task")
+    bl_sub = bl.add_subparsers(dest="bl_cmd", required=True)
+    bl_add = bl_sub.add_parser("add", help="add an idea to the backlog")
+    bl_add.add_argument("text")
+    bl_add.add_argument("--tag", action="append", default=[], dest="tags")
+    bl_ls = bl_sub.add_parser("ls", help="list backlog entries (filter by --tag / --status)")
+    bl_ls.add_argument("--tag", default=None)
+    bl_ls.add_argument("--status", choices=BL.STATUSES, default=None)
+    bl_show = bl_sub.add_parser("show", help="show a backlog entry in full")
+    bl_show.add_argument("id")
+    bl_tag = bl_sub.add_parser("tag", help="add tags to an entry (or --remove them)")
+    bl_tag.add_argument("id"); bl_tag.add_argument("tags", nargs="+")
+    bl_tag.add_argument("--remove", action="store_true")
+    bl_pr = bl_sub.add_parser("promote", help="promote an entry to a queued task for a repo")
+    bl_pr.add_argument("id"); bl_pr.add_argument("--repo", required=True)
+    bl_pr.add_argument("--id", dest="task_id", default=None)
+    bl_drop = bl_sub.add_parser("drop", help="mark an entry dropped")
+    bl_drop.add_argument("id")
     help_p = sub.add_parser("help", help="show help, optionally for a command")
     help_p.add_argument("topic", nargs="?")
     args = ap.parse_args(argv)
@@ -502,6 +533,41 @@ def main(argv=None):
             for a in acts:
                 print(f"{a['name']}\t{a['reason']}\t{a.get('freed_bytes', 0)}")
             print(f"FREED\t{freed}")
+    elif args.cmd == "backlog":
+        if args.bl_cmd == "add":
+            print(BL.add(root, args.text, args.tags))
+        elif args.bl_cmd == "ls":
+            print(f"{'ID':40} {'STATUS':9} {'AGE':5} {'TAGS':16} TEXT")
+            for e in BL.ls(root, tag=args.tag, status=args.status):
+                first = (e.get("text") or "").strip().splitlines()
+                print(f"{e['id']:40} {e['status']:9} {_age(e.get('created')):5} "
+                      f"{','.join(e.get('tags', [])):16} {(first[0] if first else '')[:60]}")
+        elif args.bl_cmd == "show":
+            try:
+                e = BL.get(root, args.id)
+            except ValueError as err:
+                print(f"td backlog show: {err}", file=sys.stderr); raise SystemExit(1)
+            print(f"id:        {e['id']}")
+            print(f"created:   {e.get('created', '')}")
+            print(f"status:    {e.get('status', '')}")
+            print(f"tags:      {', '.join(e.get('tags', []))}")
+            print(f"promoted:  {e.get('promoted_task_id') or '-'}")
+            print(f"\n{e.get('text', '')}")
+        elif args.bl_cmd == "tag":
+            try:
+                BL.tag(root, args.id, args.tags, remove=args.remove)
+            except ValueError as err:
+                print(f"td backlog tag: {err}", file=sys.stderr); raise SystemExit(1)
+        elif args.bl_cmd == "promote":
+            try:
+                print(BL.promote(root, args.id, args.repo, task_id=args.task_id))
+            except ValueError as err:
+                print(f"td backlog promote: {err}", file=sys.stderr); raise SystemExit(1)
+        elif args.bl_cmd == "drop":
+            try:
+                BL.drop(root, args.id)
+            except ValueError as err:
+                print(f"td backlog drop: {err}", file=sys.stderr); raise SystemExit(1)
 
 
 if __name__ == "__main__":
