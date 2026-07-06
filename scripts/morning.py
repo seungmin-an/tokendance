@@ -400,7 +400,16 @@ def _hb_epoch(hb):
 
 
 def live_holders(tasks, now, ttl_hours):
-    """Per-repo set of holder ids to KEEP: heartbeat newer than ttl_hours."""
+    """Per-repo set of holder ids to KEEP.
+
+    A leased slot is reclaimed only when its holder is a crashed running worker:
+    ``state == "running"`` with a heartbeat older than ttl_hours. Every other
+    existing holder is kept regardless of heartbeat — parked tasks (queued /
+    review / needs_human / blocked, paused or not) have no worker calling
+    checkpoint.py, so a null/stale heartbeat is normal and must NOT trigger
+    reclaim (else their worktrees get reset out from under a human session).
+    Orphan holders (task no longer in the list) are simply absent from keep, so
+    reclaim_stale picks them up automatically."""
     keep = {}
     cutoff = now - ttl_hours * 3600
     for t in tasks:
@@ -408,10 +417,10 @@ def live_holders(tasks, now, ttl_hours):
         if not repo:
             continue
         repo_abs = os.path.abspath(repo)
-        if _hb_epoch(t.get("heartbeat")) >= cutoff:
-            keep.setdefault(repo_abs, set()).add(t["id"])
-        else:
-            keep.setdefault(repo_abs, set())  # ensure repo key exists
+        keep.setdefault(repo_abs, set())  # ensure repo key exists
+        if t.get("state") == "running" and _hb_epoch(t.get("heartbeat")) < cutoff:
+            continue  # crashed running worker → reclaim (drop from keep)
+        keep[repo_abs].add(t["id"])
     return keep
 
 

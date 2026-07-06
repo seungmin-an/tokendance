@@ -30,18 +30,36 @@ class PoolMaintenanceTest(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_live_holders_keeps_fresh_heartbeat_drops_stale(self):
+        """Stale-heartbeat reclaim applies ONLY to crashed running workers."""
         now = time.time()
         fresh = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 60))
         stale = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 100 * 3600))
         tasks = [
-            {"id": "a", "repo": self.repo, "heartbeat": fresh},
-            {"id": "b", "repo": self.repo, "heartbeat": stale},
-            {"id": "c", "repo": self.repo, "heartbeat": None},
+            {"id": "a", "repo": self.repo, "state": "running", "heartbeat": fresh},
+            {"id": "b", "repo": self.repo, "state": "running", "heartbeat": stale},
         ]
         keep = M.live_holders(tasks, now, ttl_hours=48)
-        self.assertIn("a", keep[self.repo])
-        self.assertNotIn("b", keep[self.repo])
-        self.assertNotIn("c", keep[self.repo])
+        self.assertIn("a", keep[self.repo])       # running + fresh → keep
+        self.assertNotIn("b", keep[self.repo])    # running + stale → drop (crashed worker)
+
+    def test_live_holders_keeps_parked_tasks_regardless_of_heartbeat(self):
+        """Parked (non-running) holders are kept even with null/stale heartbeat.
+
+        queued/paused/review/needs_human/blocked tasks have no worker beating, so a
+        null or stale heartbeat is normal and must NOT trigger reclaim (dataloss guard)."""
+        now = time.time()
+        stale = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 100 * 3600))
+        tasks = [
+            {"id": "q", "repo": self.repo, "state": "queued", "heartbeat": None},
+            {"id": "qp", "repo": self.repo, "state": "queued", "heartbeat": None,
+             "paused": True},
+            {"id": "rv", "repo": self.repo, "state": "review", "heartbeat": None},
+            {"id": "nh", "repo": self.repo, "state": "needs_human", "heartbeat": None},
+            {"id": "bl", "repo": self.repo, "state": "blocked", "heartbeat": stale},
+        ]
+        keep = M.live_holders(tasks, now, ttl_hours=48)
+        for tid in ("q", "qp", "rv", "nh", "bl"):
+            self.assertIn(tid, keep[self.repo])
 
     def test_pool_maintenance_reclaims_stale_lease(self):
         pool.acquire(self.repo, "a", root=self.tmp)   # leased, will be "dead"
@@ -51,6 +69,34 @@ class PoolMaintenanceTest(unittest.TestCase):
         res = M.pool_maintenance(self.tmp, [], now=time.time(),
                                  log=lambda m: None, dry_run=False)
         self.assertIn("a", res["reclaimed"])
+        leased = {e["lease_holder"] for e in
+                  pool.load_state(pool.pool_dir(self.repo, self.tmp))["entries"] if e["leased"]}
+        self.assertEqual(leased, set())
+
+    def test_pool_maintenance_keeps_parked_lease(self):
+        """Real dataloss case: a queued+paused holder with no heartbeat keeps its slot."""
+        pool.acquire(self.repo, "review-pr", root=self.tmp)   # parked human-review session
+        with open(os.path.join(self.tmp, "config.local.md"), "w") as f:
+            f.write("POOL_LEASE_TTL_HOURS=48\nPOOL_TARGET_IDLE_DAYS=0\n")
+        tasks = [{"id": "review-pr", "repo": self.repo, "state": "queued",
+                  "heartbeat": None, "paused": True}]
+        res = M.pool_maintenance(self.tmp, tasks, now=time.time(),
+                                 log=lambda m: None, dry_run=False)
+        self.assertNotIn("review-pr", res["reclaimed"])
+        leased = {e["lease_holder"] for e in
+                  pool.load_state(pool.pool_dir(self.repo, self.tmp))["entries"] if e["leased"]}
+        self.assertEqual(leased, {"review-pr"})
+
+    def test_pool_maintenance_reclaims_crashed_running_lease(self):
+        """A running worker whose heartbeat went stale (crash) still gets its slot reclaimed."""
+        pool.acquire(self.repo, "crashed", root=self.tmp)
+        with open(os.path.join(self.tmp, "config.local.md"), "w") as f:
+            f.write("POOL_LEASE_TTL_HOURS=48\nPOOL_TARGET_IDLE_DAYS=0\n")
+        stale = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 100 * 3600))
+        tasks = [{"id": "crashed", "repo": self.repo, "state": "running", "heartbeat": stale}]
+        res = M.pool_maintenance(self.tmp, tasks, now=time.time(),
+                                 log=lambda m: None, dry_run=False)
+        self.assertIn("crashed", res["reclaimed"])
         leased = {e["lease_holder"] for e in
                   pool.load_state(pool.pool_dir(self.repo, self.tmp))["entries"] if e["leased"]}
         self.assertEqual(leased, set())
