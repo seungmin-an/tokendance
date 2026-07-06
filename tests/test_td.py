@@ -678,6 +678,85 @@ class ReviewTest(unittest.TestCase):
         self.assertTrue(self._find(calls, "new-session"))    # tmux still launched
         self.assertEqual(S.read(self.tmp, "t-rev")["state"], "queued")
 
+    def _runner_remotes(self, tid, remotes, fetch_ok=lambda r: True):
+        """Spy runner with a configurable `git remote` listing and per-remote
+        fetch outcome. `remotes` is what `git remote` reports (order matters);
+        `fetch_ok(remote)` decides each PR fetch's success."""
+        calls = []
+
+        def runner(cmd, **k):
+            calls.append(cmd)
+            if any("prepare-worktree.sh" in str(c) for c in cmd):
+                td_dir = S.task_dir(self.tmp, tid); os.makedirs(td_dir, exist_ok=True)
+                with open(os.path.join(td_dir, "worktree.path"), "w") as f:
+                    f.write(self.wt + "\n")
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+            if cmd[:3] == ["git", "-C", self.wt] and cmd[3:] == ["remote"]:
+                return types.SimpleNamespace(returncode=0,
+                                             stdout="".join(r + "\n" for r in remotes), stderr="")
+            if "fetch" in cmd and any("pull/" in str(c) for c in cmd):
+                remote = cmd[cmd.index("fetch") + 1]
+                ok = fetch_ok(remote)
+                return types.SimpleNamespace(returncode=0 if ok else 1, stdout="",
+                                             stderr="" if ok else f"couldn't find ref on {remote}")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        return calls, runner
+
+    def test_review_fetches_from_upstream_when_present(self):
+        # PR lives on upstream (furiosa-ai); origin is the user's fork.
+        calls, runner = self._runner_remotes("t-rev", ["origin", "upstream"])
+        td.cmd_review(self.tmp, 42, task_id="t-rev", claude_bin="/fake/claude",
+                      runner=runner, which=lambda _: "/fake/tmux", recall_fn=lambda *a: "")
+        fetches = self._find(calls, "pull/42/head")
+        self.assertEqual([f[4] for f in fetches], ["upstream"])   # upstream first, then stop
+        self.assertEqual(fetches[0][:5], ["git", "-C", self.wt, "fetch", "upstream"])
+
+    def test_review_falls_back_to_origin_when_no_upstream(self):
+        # origin-only repo (tokendance dogfooding) — fetch origin, no regression.
+        calls, runner = self._runner_remotes("t-rev", ["origin"])
+        td.cmd_review(self.tmp, 42, task_id="t-rev", claude_bin="/fake/claude",
+                      runner=runner, which=lambda _: "/fake/tmux", recall_fn=lambda *a: "")
+        fetches = self._find(calls, "pull/42/head")
+        self.assertEqual([f[4] for f in fetches], ["origin"])
+
+    def test_review_tries_next_remote_when_first_fetch_fails(self):
+        # upstream present but the PR fetch there fails; fall through to origin.
+        calls, runner = self._runner_remotes(
+            "t-rev", ["origin", "upstream"], fetch_ok=lambda r: r == "origin")
+        td.cmd_review(self.tmp, 42, task_id="t-rev", claude_bin="/fake/claude",
+                      runner=runner, which=lambda _: "/fake/tmux", recall_fn=lambda *a: "")
+        fetches = self._find(calls, "pull/42/head")
+        self.assertEqual([f[4] for f in fetches], ["upstream", "origin"])  # tried in order, stopped
+        self.assertTrue(self._find(calls, "FETCH_HEAD"))   # checkout proceeded after success
+        self.assertTrue(self._find(calls, "new-session"))  # session launched
+
+    def test_review_remote_flag_uses_only_that_remote(self):
+        # --remote pins the fetch: no auto-selection, upstream/origin untouched.
+        calls, runner = self._runner_remotes("t-rev", ["origin", "upstream"])
+        td.cmd_review(self.tmp, 42, task_id="t-rev", remote="myfork",
+                      claude_bin="/fake/claude", runner=runner,
+                      which=lambda _: "/fake/tmux", recall_fn=lambda *a: "")
+        fetches = self._find(calls, "pull/42/head")
+        self.assertEqual([f[4] for f in fetches], ["myfork"])
+        self.assertFalse(self._find(calls, "remote"))      # never enumerated remotes
+
+    def test_review_errors_when_all_remotes_fail_lists_them(self):
+        import io, contextlib
+        calls, runner = self._runner_remotes(
+            "t-rev", ["origin", "upstream"], fetch_ok=lambda r: False)
+        buf = io.StringIO()
+        with self.assertRaises(SystemExit) as ctx, contextlib.redirect_stderr(buf):
+            td.cmd_review(self.tmp, 42, task_id="t-rev", claude_bin="/fake/claude",
+                          runner=runner, which=lambda _: "/fake/tmux", recall_fn=lambda *a: "")
+        self.assertNotEqual(ctx.exception.code, 0)
+        msg = buf.getvalue()
+        self.assertIn("upstream", msg)                     # tried-remotes named
+        self.assertIn("origin", msg)
+        self.assertIn("td task abort t-rev", msg)          # discard guidance kept
+        self.assertFalse(self._find(calls, "FETCH_HEAD"))  # never checked out
+        self.assertFalse(self._find(calls, "new-session")) # never launched tmux
+
     def test_review_is_top_level_command_with_default_repo(self):
         captured = {}
         orig = td.cmd_review
@@ -689,7 +768,18 @@ class ReviewTest(unittest.TestCase):
             td.main(["--root", self.tmp, "review", "42"])
         self.assertEqual(captured["n"], 42)                  # positional PR number, int
         self.assertEqual(captured.get("repo"), "/root/npu-tools")   # default repo
+        self.assertIsNone(captured.get("remote"))            # auto-select by default
         self.assertEqual(buf.getvalue().strip(), "t-rev")    # prints the created id
+
+    def test_review_remote_flag_flows_through_dispatch(self):
+        captured = {}
+        orig = td.cmd_review
+        td.cmd_review = lambda root, n, **k: (captured.update({"root": root, "n": n, **k}), "t-rev")[1]
+        self.addCleanup(lambda: setattr(td, "cmd_review", orig))
+        import io, contextlib
+        with contextlib.redirect_stdout(io.StringIO()):
+            td.main(["--root", self.tmp, "review", "42", "--remote", "upstream"])
+        self.assertEqual(captured.get("remote"), "upstream")
 
     def test_help_tree_includes_review(self):
         import io, contextlib
