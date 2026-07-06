@@ -405,7 +405,25 @@ def cmd_open(root, repo, desc="", task_id=None, skip_permissions=False,
     return task_id
 
 
-def cmd_review(root, n, repo=DEFAULT_REVIEW_REPO, task_id=None, skip_permissions=False,
+def _pr_fetch_remotes(runner, wt, remote=None):
+    """Ordered remotes to try fetching a PR's pull/<n>/head from.
+
+    A PR ref lives only on the remote that hosts the PR — for a fork checkout
+    (origin = user fork) the PR usually sits on `upstream`, not origin, so
+    hardcoding origin fails. Priority: an explicit `remote` wins outright;
+    otherwise upstream, then origin, then any other registered remote. Falls
+    back to ["origin"] when none are discovered (preserves the legacy
+    origin-only behavior)."""
+    if remote:
+        return [remote]
+    res = runner(["git", "-C", wt, "remote"], capture_output=True, text=True)
+    names = [ln.strip() for ln in (getattr(res, "stdout", "") or "").splitlines() if ln.strip()]
+    ordered = [r for r in ("upstream", "origin") if r in names]
+    ordered += [r for r in names if r not in ordered]
+    return ordered or ["origin"]
+
+
+def cmd_review(root, n, repo=DEFAULT_REVIEW_REPO, remote=None, task_id=None, skip_permissions=False,
                claude_bin=None, runner=subprocess.run, which=shutil.which,
                recall_fn=_recall_block):
     """Provision a one-shot PR-review session — cmd_open's forward extension.
@@ -425,13 +443,20 @@ def cmd_review(root, n, repo=DEFAULT_REVIEW_REPO, task_id=None, skip_permissions
     task_id, wt, sid, claude, tmux = _provision_session_worktree(
         root, repo, f"review PR #{n}", task_id, "review", runner, which, claude_bin)
     # Check the PR head out into the worktree (detached; leaves branch tokendance/<id>
-    # intact so reclaim still works). Fetch then checkout, hard-failing on either.
-    fetch = runner(["git", "-C", wt, "fetch", "origin", f"pull/{n}/head"],
-                   capture_output=True, text=True)
-    if getattr(fetch, "returncode", 1) != 0:
-        print(f"td review: failed to fetch pull/{n}/head into {wt} "
-              f"(discard with 'td task abort {task_id}'):\n{getattr(fetch, 'stderr', '') or ''}".rstrip(),
-              file=sys.stderr)
+    # intact so reclaim still works). Try each candidate remote and stop at the first
+    # that has pull/<n>/head; failed attempts stay captured (no terminal noise) and only
+    # a full miss is reported. Fetch then checkout, hard-failing on either.
+    remotes = _pr_fetch_remotes(runner, wt, remote)
+    fetch = None
+    for r in remotes:
+        fetch = runner(["git", "-C", wt, "fetch", r, f"pull/{n}/head"],
+                       capture_output=True, text=True)
+        if getattr(fetch, "returncode", 1) == 0:
+            break
+    else:
+        print(f"td review: failed to fetch pull/{n}/head into {wt} from any remote "
+              f"(tried: {', '.join(remotes)}; discard with 'td task abort {task_id}'):\n"
+              f"{getattr(fetch, 'stderr', '') or ''}".rstrip(), file=sys.stderr)
         raise SystemExit(1)
     co = runner(["git", "-C", wt, "checkout", "--detach", "FETCH_HEAD"],
                 capture_output=True, text=True)
@@ -578,6 +603,8 @@ def main(argv=None):
     rv = sub.add_parser("review", help="provision a PR-review session (PR checkout + /rust-review primed + tmux)")
     rv.add_argument("n", type=int, help="GitHub PR number")
     rv.add_argument("--repo", default=DEFAULT_REVIEW_REPO, help="target repo (default: %(default)s)")
+    rv.add_argument("--remote", default=None,
+                    help="fetch the PR from this remote (default: auto — upstream, then origin)")
     rv.add_argument("--id", default=None)
     rv.add_argument("--skip-permissions", action="store_true",
                     help="pass --dangerously-skip-permissions (default: keep interactive permission prompts)")
@@ -646,7 +673,7 @@ def main(argv=None):
                 print(f"td task open: {e}", file=sys.stderr); raise SystemExit(1)
     elif args.cmd == "review":
         try:
-            print(cmd_review(root, args.n, repo=args.repo, task_id=args.id,
+            print(cmd_review(root, args.n, repo=args.repo, remote=args.remote, task_id=args.id,
                              skip_permissions=args.skip_permissions))
         except ValueError as e:
             print(f"td review: {e}", file=sys.stderr); raise SystemExit(1)
