@@ -125,6 +125,80 @@ class SymlinkTest(unittest.TestCase):
                          os.path.realpath(os.path.join(self.repo, ".venv")))
 
 
+class ManifestTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.repo = os.path.join(self.tmp, "repo")
+        os.makedirs(self.repo)
+        self.wt = os.path.join(self.tmp, "wt")
+        os.makedirs(self.wt)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_manifest(self, *lines):
+        with open(os.path.join(self.repo, ".tokendance-worktree.manifest"), "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+    def test_no_manifest_file_is_a_noop(self):
+        pool.apply_worktree_manifest(self.repo, self.wt)
+        self.assertEqual(os.listdir(self.wt), [])
+
+    def test_missing_worktree_path_symlinks_whole_dir(self):
+        os.makedirs(os.path.join(self.repo, "artifacts", "libtorch", "current"))
+        self._write_manifest("artifacts/libtorch")
+        pool.apply_worktree_manifest(self.repo, self.wt)
+        link = os.path.join(self.wt, "artifacts", "libtorch")
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(os.path.realpath(link),
+                         os.path.realpath(os.path.join(self.repo, "artifacts", "libtorch")))
+
+    def test_existing_dir_gets_child_level_merge(self):
+        # main checkout has the dvc pointer + the extracted (gitignored) dir
+        src = os.path.join(self.repo, "artifacts", "libtorch")
+        os.makedirs(src)
+        with open(os.path.join(src, "libtorch.dvc"), "w") as f:
+            f.write("dvc-pointer")
+        os.makedirs(os.path.join(src, "current", "lib"))
+        # worktree already has the dir via git checkout, with only the tracked pointer
+        dst = os.path.join(self.wt, "artifacts", "libtorch")
+        os.makedirs(dst)
+        with open(os.path.join(dst, "libtorch.dvc"), "w") as f:
+            f.write("dvc-pointer")  # tracked — must stay a real file, not linked over
+        self._write_manifest("artifacts/libtorch")
+        pool.apply_worktree_manifest(self.repo, self.wt)
+        self.assertFalse(os.path.islink(os.path.join(dst, "libtorch.dvc")))
+        current_link = os.path.join(dst, "current")
+        self.assertTrue(os.path.islink(current_link))
+        self.assertEqual(os.path.realpath(current_link),
+                         os.path.realpath(os.path.join(src, "current")))
+
+    def test_missing_source_path_skipped_without_error(self):
+        self._write_manifest("artifacts/does-not-exist")
+        pool.apply_worktree_manifest(self.repo, self.wt)  # must not raise
+        self.assertFalse(os.path.exists(os.path.join(self.wt, "artifacts")))
+
+    def test_blank_lines_and_comments_ignored(self):
+        os.makedirs(os.path.join(self.repo, "cache"))
+        self._write_manifest("", "# a comment", "cache", "")
+        pool.apply_worktree_manifest(self.repo, self.wt)
+        self.assertTrue(os.path.islink(os.path.join(self.wt, "cache")))
+
+    def test_acquire_applies_manifest_on_new_and_reacquired_slot(self):
+        repo = _init_repo(self.repo)
+        src = os.path.join(repo, "artifacts", "libtorch")
+        os.makedirs(os.path.join(src, "current"))
+        with open(os.path.join(repo, ".tokendance-worktree.manifest"), "w") as f:
+            f.write("artifacts/libtorch\n")
+        p1 = pool.acquire(repo, "task-1", root=self.tmp)
+        link = os.path.join(p1, "artifacts", "libtorch")
+        self.assertTrue(os.path.islink(link))
+        # idempotent-owner reacquire path also (re-)applies the manifest
+        p2 = pool.acquire(repo, "task-1", root=self.tmp)
+        self.assertEqual(p1, p2)
+        self.assertTrue(os.path.islink(os.path.join(p2, "artifacts", "libtorch")))
+
+
 def _branch(wt):
     return subprocess.run(["git", "-C", wt, "rev-parse", "--abbrev-ref", "HEAD"],
                           capture_output=True, text=True).stdout.strip()
