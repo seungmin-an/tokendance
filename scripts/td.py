@@ -212,13 +212,30 @@ def _worktree_path(root, task_id):
     return _read(os.path.join(S.task_dir(root, task_id), "worktree.path")) or None
 
 
-def _tmux_new_session_cmd(tmux, session_name, cwd, inner):
+def _worker_env_prefix(repo, wt):
+    """Shell prefix that exports WORKTREE and, if the target repo provides one,
+    sources .tokendance-worktree.env before the real command runs — mirrors
+    launch-worker.sh's headless worker-env injection (e.g. npu-tools' LIBTORCH)
+    for human-driven tmux sessions, which exec claude directly and so never go
+    through launch-worker.sh. The `[ -f ... ]` check happens in the shell at
+    tmux-launch time, not here, so a missing file is simply a no-op."""
+    env_file = os.path.join(repo, ".tokendance-worktree.env")
+    return (f"export WORKTREE={shlex.quote(wt)}; "
+            f"[ -f {shlex.quote(env_file)} ] && {{ set -a; . {shlex.quote(env_file)}; set +a; }}; ")
+
+
+def _tmux_new_session_cmd(tmux, session_name, cwd, inner, repo=None):
     """The `tmux new-session -d` argv that runs `inner` (a command argv) in `cwd`
     under `session_name`. Single-sources the detached-session provisioning shape
-    shared by cmd_open (fresh --session-id) and cmd_attach (--resume): tmux runs
-    the window command through a shell, so `inner` is shlex-quoted into one string."""
-    return [tmux, "new-session", "-d", "-s", session_name, "-c", cwd,
-            " ".join(shlex.quote(a) for a in inner)]
+    shared by cmd_open (fresh --session-id), cmd_attach (--resume), and cmd_review
+    (--resume after priming): tmux runs the window command through a shell, so
+    `inner` is shlex-quoted into one string. When `repo` is given, the string is
+    prefixed with _worker_env_prefix so the repo's .tokendance-worktree.env (if
+    any) is sourced before `inner` runs."""
+    cmd = " ".join(shlex.quote(a) for a in inner)
+    if repo:
+        cmd = _worker_env_prefix(repo, cwd) + cmd
+    return [tmux, "new-session", "-d", "-s", session_name, "-c", cwd, cmd]
 
 
 def _exec_tmux_attach(tmux, session_name):
@@ -284,7 +301,7 @@ def cmd_attach(root, task_id, skip_permissions=False, claude_bin=None,
         inner = ["env", "IS_SANDBOX=1", claude, "--resume", sid]  # IS_SANDBOX → root boot
         if skip_permissions:                     # default keeps interactive permission prompts
             inner.append("--dangerously-skip-permissions")
-        res = runner(_tmux_new_session_cmd(tmux, session_name, wt, inner),
+        res = runner(_tmux_new_session_cmd(tmux, session_name, wt, inner, repo=d.get("repo")),
                      capture_output=True, text=True)
         if getattr(res, "returncode", 1) != 0:
             print(f"td task attach: tmux failed to create session {session_name}:\n"
@@ -358,10 +375,11 @@ def _provision_session_worktree(root, repo, desc, task_id, cmd_name,
     return task_id, wt, sid, claude, tmux
 
 
-def _tmux_launch(runner, tmux, session_name, wt, inner, cmd_name, task_id):
+def _tmux_launch(runner, tmux, session_name, wt, inner, cmd_name, task_id, repo=None):
     """Start `inner` (an argv) in a detached tmux session `session_name` with its
-    window cwd = worktree. Raises SystemExit if tmux fails. Shared by open/review."""
-    res = runner(_tmux_new_session_cmd(tmux, session_name, wt, inner),
+    window cwd = worktree. Raises SystemExit if tmux fails. Shared by open/review.
+    `repo` (when given) sources that repo's .tokendance-worktree.env first."""
+    res = runner(_tmux_new_session_cmd(tmux, session_name, wt, inner, repo=repo),
                  capture_output=True, text=True)
     if getattr(res, "returncode", 1) != 0:
         print(f"td {cmd_name}: tmux failed to create session {session_name} "
@@ -396,7 +414,8 @@ def cmd_open(root, repo, desc="", task_id=None, skip_permissions=False,
     if skip_permissions:                          # default keeps interactive permission prompts
         inner.append("--dangerously-skip-permissions")
     session_name = f"td-{task_id}"
-    _tmux_launch(runner, tmux, session_name, wt, inner, "task open", task_id)
+    _tmux_launch(runner, tmux, session_name, wt, inner, "task open", task_id,
+                 repo=os.path.abspath(repo))
     print(f"opened {task_id}: human-driven session {session_name} (detached) in {wt}\n"
           f"  attach:  tmux attach -t {session_name}\n"
           f"  offload: td task resume {task_id}   (hand off to a headless worker)\n"
@@ -484,7 +503,8 @@ def cmd_review(root, n, repo=DEFAULT_REVIEW_REPO, remote=None, task_id=None, ski
     inner = ["env", "IS_SANDBOX=1", claude, "--resume", sid]
     if skip_permissions:
         inner.append("--dangerously-skip-permissions")
-    _tmux_launch(runner, tmux, session_name, wt, inner, "review", task_id)
+    _tmux_launch(runner, tmux, session_name, wt, inner, "review", task_id,
+                 repo=os.path.abspath(repo))
     print(f"review {task_id}: PR #{n} checked out + /rust-review primed; "
           f"session {session_name} (detached) in {wt}\n"
           f"  attach:  tmux attach -t {session_name}\n"

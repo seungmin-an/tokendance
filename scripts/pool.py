@@ -114,6 +114,51 @@ def apply_shared_symlinks(repo, wt, root=None):
         os.symlink(src, dst)
 
 
+def worktree_manifest(repo):
+    """<repo>/.tokendance-worktree.manifest entries: one repo-root-relative path
+    per line (blank lines and #-comments ignored). Missing file → []."""
+    path = os.path.join(repo, ".tokendance-worktree.manifest")
+    try:
+        with open(path) as f:
+            return [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
+    except FileNotFoundError:
+        return []
+
+
+def apply_worktree_manifest(repo, wt):
+    """Symlink heavy shared artifacts (e.g. dvc-extracted libtorch) from the main
+    checkout into a worktree, per <repo>/.tokendance-worktree.manifest.
+
+    Unlike apply_shared_symlinks (whole-dir, .venv-style), a manifest entry may
+    already exist in the worktree as a git-checked-out directory mixed with
+    gitignored content (e.g. artifacts/furiosa-libtorch has tracked *.dvc pointer
+    files alongside gitignored current/jammy/noble extraction dirs). Whole-dir
+    symlinking would fail there, so this does a one-level child merge instead:
+    only children missing from the worktree side get linked; tracked children are
+    left untouched. Missing manifest file → no-op (repos without one, including
+    tokendance's own dogfood checkout, are unaffected)."""
+    for rel in worktree_manifest(repo):
+        src = os.path.join(repo, rel)
+        if not os.path.exists(src):
+            continue
+        dst = os.path.join(wt, rel)
+        if os.path.islink(dst):
+            os.unlink(dst)
+            os.symlink(src, dst)
+            continue
+        if not os.path.exists(dst):
+            os.makedirs(os.path.dirname(dst) or wt, exist_ok=True)
+            os.symlink(src, dst)
+            continue
+        if not os.path.isdir(dst) or not os.path.isdir(src):
+            continue  # a real (non-symlink) file already there — leave it
+        for name in os.listdir(src):
+            child_dst = os.path.join(dst, name)
+            if os.path.exists(child_dst) or os.path.islink(child_dst):
+                continue  # already git-tracked (or previously linked) — don't touch
+            os.symlink(os.path.join(src, name), child_dst)
+
+
 def max_trees(root=None):
     return config.get_int("POOL_MAX_TREES", r=root)
 
@@ -162,6 +207,7 @@ def acquire(repo, holder, root=None):
                       and os.path.isdir(e["path"])), None)
         if owned is not None:
             apply_shared_symlinks(repo, owned["path"], root)
+            apply_worktree_manifest(repo, owned["path"])
             return owned["path"]
         git(repo, "fetch", "origin", check=False)
         ref = default_ref(repo)
@@ -184,6 +230,7 @@ def acquire(repo, holder, root=None):
         slot["lease_holder"] = holder
         save_state(pdir, state)
         apply_shared_symlinks(repo, slot["path"], root)
+        apply_worktree_manifest(repo, slot["path"])
         return slot["path"]
 
 
