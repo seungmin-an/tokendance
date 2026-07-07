@@ -208,6 +208,36 @@ class InterveneTest(unittest.TestCase):
         self.assertTrue(any("launch-worker.sh" in " ".join(c) and "--resume" in c for c in calls))
 
 
+class WorkerEnvPrefixTest(unittest.TestCase):
+    """_worker_env_prefix backs the tmux-launched human-driven sessions (attach/
+    open/review) with the same .tokendance-worktree.env sourcing launch-worker.sh
+    already does for headless workers. Executed through real bash (not mocked)
+    so a passing test proves the env file is actually sourced, not just that the
+    right substring appears in a command string."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_sources_env_file_when_present(self):
+        with open(os.path.join(self.tmp, ".tokendance-worktree.env"), "w") as f:
+            f.write('export LIBTORCH="$WORKTREE/artifacts/libtorch/current"\n')
+        prefix = td._worker_env_prefix(self.tmp, "/some/wt")
+        out = _sp.run(["bash", "-c", prefix + "printf '%s|%s' \"$LIBTORCH\" \"$WORKTREE\""],
+                      capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout, "/some/wt/artifacts/libtorch/current|/some/wt")
+
+    def test_noop_when_env_file_missing(self):
+        prefix = td._worker_env_prefix(self.tmp, "/some/wt")   # no .tokendance-worktree.env written
+        out = _sp.run(["bash", "-c", prefix + "printf 'done:%s' \"${LIBTORCH:-}\""],
+                      capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout, "done:")
+
+
 class AttachTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -306,6 +336,28 @@ class AttachTest(unittest.TestCase):
         self.assertIn("--resume", shell_cmd)
         self.assertIn("SID-123", shell_cmd)          # resumes the preserved session id
         self.assertNotIn("--dangerously-skip-permissions", shell_cmd)  # default keeps prompts
+
+    def test_attach_tmux_sources_repos_worktree_env_when_present(self):
+        repo = os.path.join(self.tmp, "repo-with-env")
+        os.makedirs(repo)
+        with open(os.path.join(repo, ".tokendance-worktree.env"), "w") as f:
+            f.write("export FOO=bar\n")
+        S.update(self.tmp, "t1", {"worker_pid": None, "repo": repo})
+        calls, runner, attached, execer = self._spies()
+        td.cmd_attach(self.tmp, "t1", claude_bin="/fake/claude",
+                      runner=runner, which=lambda _: "/fake/tmux", execer=execer)
+        shell_cmd = self._new_session_call(calls)[-1]
+        self.assertIn(f"WORKTREE={self.wt}", shell_cmd)
+        self.assertIn(os.path.join(repo, ".tokendance-worktree.env"), shell_cmd)
+
+    def test_attach_tmux_argv_unaffected_when_repo_has_no_env_file(self):
+        S.update(self.tmp, "t1", {"worker_pid": None, "repo": self.tmp})  # no env file here
+        calls, runner, attached, execer = self._spies()
+        td.cmd_attach(self.tmp, "t1", claude_bin="/fake/claude",
+                      runner=runner, which=lambda _: "/fake/tmux", execer=execer)
+        shell_cmd = self._new_session_call(calls)[-1]
+        self.assertIn("--resume", shell_cmd)   # normal command still present and well-formed
+        self.assertIn("SID-123", shell_cmd)
 
     def test_attach_execs_tmux_attach_to_session(self):
         S.update(self.tmp, "t1", {"worker_pid": None})
@@ -436,6 +488,18 @@ class OpenTest(unittest.TestCase):
         self.assertIn(sid, shell_cmd)                    # the recorded session id is what claude gets
         self.assertIn("RECALL-BLOB", shell_cmd)          # library recall injected
         self.assertNotIn("--dangerously-skip-permissions", shell_cmd)  # default keeps prompts
+
+    def test_open_tmux_sources_repos_worktree_env_when_present(self):
+        repo = os.path.join(self.tmp, "repo-with-env")
+        os.makedirs(repo)
+        with open(os.path.join(repo, ".tokendance-worktree.env"), "w") as f:
+            f.write("export FOO=bar\n")
+        calls, runner = self._runner("t-open")
+        td.cmd_open(self.tmp, repo, "d", task_id="t-open", claude_bin="/fake/claude",
+                    runner=runner, which=lambda _: "/fake/tmux", recall_fn=lambda *a: "")
+        shell_cmd = self._tmux_call(calls)[-1]
+        self.assertIn(f"WORKTREE={self.wt}", shell_cmd)
+        self.assertIn(os.path.join(repo, ".tokendance-worktree.env"), shell_cmd)
 
     def test_open_skip_permissions_adds_flag(self):
         calls, runner = self._runner("t-open")
@@ -570,6 +634,18 @@ class ReviewTest(unittest.TestCase):
         self.assertIn("IS_SANDBOX=1", shell_cmd)
         self.assertIn("--resume", shell_cmd)             # resume the primed session (not fresh)
         self.assertIn(sid, shell_cmd)
+
+    def test_review_tmux_sources_repos_worktree_env_when_present(self):
+        repo = os.path.join(self.tmp, "repo-with-env")
+        os.makedirs(repo)
+        with open(os.path.join(repo, ".tokendance-worktree.env"), "w") as f:
+            f.write("export FOO=bar\n")
+        calls, runner = self._runner("t-rev")
+        td.cmd_review(self.tmp, 42, repo=repo, task_id="t-rev", claude_bin="/fake/claude",
+                      runner=runner, which=lambda _: "/fake/tmux", recall_fn=lambda *a: "")
+        shell_cmd = self._find(calls, "new-session")[0][-1]
+        self.assertIn(f"WORKTREE={self.wt}", shell_cmd)
+        self.assertIn(os.path.join(repo, ".tokendance-worktree.env"), shell_cmd)
 
     def test_review_prime_happens_before_tmux(self):
         # the session must be primed (populated) before it is resumed in tmux
