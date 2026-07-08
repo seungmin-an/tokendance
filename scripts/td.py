@@ -245,7 +245,7 @@ def _exec_tmux_attach(tmux, session_name):
     os.execvp(tmux, [tmux, "attach", "-t", session_name])
 
 
-def cmd_attach(root, task_id, skip_permissions=False, claude_bin=None,
+def cmd_attach(root, task_id, claude_bin=None,
                runner=subprocess.run, which=shutil.which, execer=_exec_tmux_attach):
     """Hand a worker's session over to a human, inside a tmux session they can detach.
 
@@ -298,9 +298,8 @@ def cmd_attach(root, task_id, skip_permissions=False, claude_bin=None,
     exists = getattr(runner([tmux, "has-session", "-t", session_name],
                             capture_output=True, text=True), "returncode", 1) == 0
     if not exists:
-        inner = ["env", "IS_SANDBOX=1", claude, "--resume", sid]  # IS_SANDBOX → root boot
-        if skip_permissions:                     # default keeps interactive permission prompts
-            inner.append("--dangerously-skip-permissions")
+        # IS_SANDBOX=1 → root boot; --dangerously-skip-permissions always on (matches headless workers)
+        inner = ["env", "IS_SANDBOX=1", claude, "--resume", sid, "--dangerously-skip-permissions"]
         res = runner(_tmux_new_session_cmd(tmux, session_name, wt, inner, repo=d.get("repo")),
                      capture_output=True, text=True)
         if getattr(res, "returncode", 1) != 0:
@@ -388,7 +387,7 @@ def _tmux_launch(runner, tmux, session_name, wt, inner, cmd_name, task_id, repo=
         raise SystemExit(1)
 
 
-def cmd_open(root, repo, desc="", task_id=None, skip_permissions=False,
+def cmd_open(root, repo, desc="", task_id=None,
              claude_bin=None, runner=subprocess.run, which=shutil.which,
              recall_fn=_recall_block):
     """Provision a human-driven worktree session (tmux + claude + recall).
@@ -411,8 +410,7 @@ def cmd_open(root, repo, desc="", task_id=None, skip_permissions=False,
     inner = ["env", "IS_SANDBOX=1", claude, "--session-id", sid]
     if recall:                                    # empty recall → omit the flag entirely
         inner += ["--append-system-prompt", recall]
-    if skip_permissions:                          # default keeps interactive permission prompts
-        inner.append("--dangerously-skip-permissions")
+    inner.append("--dangerously-skip-permissions")  # always on (matches headless workers)
     session_name = f"td-{task_id}"
     _tmux_launch(runner, tmux, session_name, wt, inner, "task open", task_id,
                  repo=os.path.abspath(repo))
@@ -442,7 +440,7 @@ def _pr_fetch_remotes(runner, wt, remote=None):
     return ordered or ["origin"]
 
 
-def cmd_review(root, n, repo=DEFAULT_REVIEW_REPO, remote=None, task_id=None, skip_permissions=False,
+def cmd_review(root, n, repo=DEFAULT_REVIEW_REPO, remote=None, task_id=None,
                claude_bin=None, runner=subprocess.run, which=shutil.which,
                recall_fn=_recall_block):
     """Provision a one-shot PR-review session — cmd_open's forward extension.
@@ -490,19 +488,16 @@ def cmd_review(root, n, repo=DEFAULT_REVIEW_REPO, remote=None, task_id=None, ski
     prime = ["env", "IS_SANDBOX=1", claude, "--session-id", sid, "-p", f"/rust-review {n}"]
     if recall:
         prime += ["--append-system-prompt", recall]
-    if skip_permissions:
-        prime.append("--dangerously-skip-permissions")
+    prime.append("--dangerously-skip-permissions")  # always on (matches headless workers)
     pr = runner(prime, cwd=wt, capture_output=True, text=True)
     if getattr(pr, "returncode", 1) != 0:
         print(f"td review: headless /rust-review prime failed for {task_id} "
               f"(session opens anyway; run '/rust-review {n}' after attaching):\n"
               f"{getattr(pr, 'stderr', '') or ''}".rstrip(), file=sys.stderr)
     # Resume the primed session in a detached tmux (like attach, resume carries no
-    # recall — the prime already appended it). skip_permissions matches the prime.
+    # recall — the prime already appended it). Always skips permissions, matching the prime.
     session_name = f"td-{task_id}"
-    inner = ["env", "IS_SANDBOX=1", claude, "--resume", sid]
-    if skip_permissions:
-        inner.append("--dangerously-skip-permissions")
+    inner = ["env", "IS_SANDBOX=1", claude, "--resume", sid, "--dangerously-skip-permissions"]
     _tmux_launch(runner, tmux, session_name, wt, inner, "review", task_id,
                  repo=os.path.abspath(repo))
     print(f"review {task_id}: PR #{n} checked out + /rust-review primed; "
@@ -600,8 +595,6 @@ def main(argv=None):
     ab.add_argument("--fail", action="store_true", help="mark failed instead of requeue")
     at = task_sub.add_parser("attach", help="stop a worker and take over its session in tmux (claude --resume; detach with Ctrl-b d)")
     at.add_argument("task_id")
-    at.add_argument("--skip-permissions", action="store_true",
-                    help="pass --dangerously-skip-permissions (default: keep interactive permission prompts)")
     sp = task_sub.add_parser("spawn", help="create a queued coding task for a repo")
     sp.add_argument("--repo", required=True)
     sp.add_argument("desc"); sp.add_argument("--id", default=None)
@@ -609,8 +602,6 @@ def main(argv=None):
     op.add_argument("--repo", required=True)
     op.add_argument("desc", nargs="?", default="")
     op.add_argument("--id", default=None)
-    op.add_argument("--skip-permissions", action="store_true",
-                    help="pass --dangerously-skip-permissions (default: keep interactive permission prompts)")
     wt = sub.add_parser("worktree", help="inspect/manage the warm worktree pool (ls, disk, gc)")
     wt_sub = wt.add_subparsers(dest="wt_cmd", required=True)
     wt_ls = wt_sub.add_parser("ls", help="list pool slots with holder task, state, and target size")
@@ -626,8 +617,6 @@ def main(argv=None):
     rv.add_argument("--remote", default=None,
                     help="fetch the PR from this remote (default: auto — upstream, then origin)")
     rv.add_argument("--id", default=None)
-    rv.add_argument("--skip-permissions", action="store_true",
-                    help="pass --dangerously-skip-permissions (default: keep interactive permission prompts)")
     bl = sub.add_parser("backlog", help="idea backlog: add, list, tag, promote to a task")
     bl_sub = bl.add_subparsers(dest="bl_cmd", required=True)
     bl_add = bl_sub.add_parser("add", help="add an idea to the backlog")
@@ -679,7 +668,7 @@ def main(argv=None):
         elif args.task_cmd == "abort":
             cmd_abort(root, args.task_id, mode="fail" if args.fail else "requeue")
         elif args.task_cmd == "attach":
-            cmd_attach(root, args.task_id, skip_permissions=args.skip_permissions)
+            cmd_attach(root, args.task_id)
         elif args.task_cmd == "spawn":
             try:
                 print(cmd_spawn(root, args.repo, args.desc, task_id=args.id))
@@ -687,14 +676,12 @@ def main(argv=None):
                 print(f"td task spawn: {e}", file=sys.stderr); raise SystemExit(1)
         elif args.task_cmd == "open":
             try:
-                print(cmd_open(root, args.repo, args.desc, task_id=args.id,
-                               skip_permissions=args.skip_permissions))
+                print(cmd_open(root, args.repo, args.desc, task_id=args.id))
             except ValueError as e:
                 print(f"td task open: {e}", file=sys.stderr); raise SystemExit(1)
     elif args.cmd == "review":
         try:
-            print(cmd_review(root, args.n, repo=args.repo, remote=args.remote, task_id=args.id,
-                             skip_permissions=args.skip_permissions))
+            print(cmd_review(root, args.n, repo=args.repo, remote=args.remote, task_id=args.id))
         except ValueError as e:
             print(f"td review: {e}", file=sys.stderr); raise SystemExit(1)
     elif args.cmd == "worktree":

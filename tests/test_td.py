@@ -335,7 +335,7 @@ class AttachTest(unittest.TestCase):
         self.assertIn("/fake/claude", shell_cmd)
         self.assertIn("--resume", shell_cmd)
         self.assertIn("SID-123", shell_cmd)          # resumes the preserved session id
-        self.assertNotIn("--dangerously-skip-permissions", shell_cmd)  # default keeps prompts
+        self.assertIn("--dangerously-skip-permissions", shell_cmd)  # always skips (matches headless workers)
 
     def test_attach_tmux_sources_repos_worktree_env_when_present(self):
         repo = os.path.join(self.tmp, "repo-with-env")
@@ -393,13 +393,6 @@ class AttachTest(unittest.TestCase):
         self.assertEqual(d["state"], "queued")
         self.assertTrue(d["paused"])
         self.assertIsNone(d["worker_pid"])
-
-    def test_attach_skip_permissions_adds_flag(self):
-        S.update(self.tmp, "t1", {"worker_pid": None})   # no live worker
-        calls, runner, attached, execer = self._spies()
-        td.cmd_attach(self.tmp, "t1", skip_permissions=True, claude_bin="/fake/claude",
-                      runner=runner, which=lambda _: "/fake/tmux", execer=execer)
-        self.assertIn("--dangerously-skip-permissions", self._new_session_call(calls)[-1])
 
 
 class SpawnTest(unittest.TestCase):
@@ -487,7 +480,7 @@ class OpenTest(unittest.TestCase):
         self.assertIn("--session-id", shell_cmd)
         self.assertIn(sid, shell_cmd)                    # the recorded session id is what claude gets
         self.assertIn("RECALL-BLOB", shell_cmd)          # library recall injected
-        self.assertNotIn("--dangerously-skip-permissions", shell_cmd)  # default keeps prompts
+        self.assertIn("--dangerously-skip-permissions", shell_cmd)  # always skips (matches headless workers)
 
     def test_open_tmux_sources_repos_worktree_env_when_present(self):
         repo = os.path.join(self.tmp, "repo-with-env")
@@ -500,13 +493,6 @@ class OpenTest(unittest.TestCase):
         shell_cmd = self._tmux_call(calls)[-1]
         self.assertIn(f"WORKTREE={self.wt}", shell_cmd)
         self.assertIn(os.path.join(repo, ".tokendance-worktree.env"), shell_cmd)
-
-    def test_open_skip_permissions_adds_flag(self):
-        calls, runner = self._runner("t-open")
-        td.cmd_open(self.tmp, "/r", "d", task_id="t-open", skip_permissions=True,
-                    claude_bin="/fake/claude", runner=runner,
-                    which=lambda _: "/fake/tmux", recall_fn=lambda *a: "")
-        self.assertIn("--dangerously-skip-permissions", self._tmux_call(calls)[-1])
 
     def test_open_empty_recall_omits_append_system_prompt(self):
         calls, runner = self._runner("t-open")
@@ -623,6 +609,7 @@ class ReviewTest(unittest.TestCase):
         self.assertEqual(prime[prime.index("--session-id") + 1], sid)
         self.assertIn("--append-system-prompt", prime)
         self.assertIn("RECALL-BLOB", prime)
+        self.assertIn("--dangerously-skip-permissions", prime)  # always skips (matches headless workers)
         self.assertEqual(self.prime_cwd, self.wt)        # primed in the worktree
         # (4) detached tmux resuming the primed session
         tmux = self._find(calls, "new-session")[0]
@@ -634,6 +621,7 @@ class ReviewTest(unittest.TestCase):
         self.assertIn("IS_SANDBOX=1", shell_cmd)
         self.assertIn("--resume", shell_cmd)             # resume the primed session (not fresh)
         self.assertIn(sid, shell_cmd)
+        self.assertIn("--dangerously-skip-permissions", shell_cmd)  # always skips (matches headless workers)
 
     def test_review_tmux_sources_repos_worktree_env_when_present(self):
         repo = os.path.join(self.tmp, "repo-with-env")
@@ -655,14 +643,6 @@ class ReviewTest(unittest.TestCase):
         prime_idx = next(i for i, c in enumerate(calls) if any("/rust-review" in str(x) for x in c))
         tmux_idx = next(i for i, c in enumerate(calls) if any("new-session" in str(x) for x in c))
         self.assertLess(prime_idx, tmux_idx)
-
-    def test_review_skip_permissions_adds_flag_to_prime_and_tmux(self):
-        calls, runner = self._runner("t-rev")
-        td.cmd_review(self.tmp, 42, task_id="t-rev", skip_permissions=True,
-                      claude_bin="/fake/claude", runner=runner,
-                      which=lambda _: "/fake/tmux", recall_fn=lambda *a: "")
-        self.assertIn("--dangerously-skip-permissions", self._find(calls, "/rust-review")[0])
-        self.assertIn("--dangerously-skip-permissions", self._find(calls, "new-session")[0][-1])
 
     def test_review_empty_recall_omits_append_system_prompt(self):
         calls, runner = self._runner("t-rev")
