@@ -191,10 +191,13 @@ def _next_name(state):
     return str(i)
 
 
-def acquire(repo, holder, root=None):
+def acquire(repo, holder, root=None, busy_paths=None):
     repo = os.path.abspath(repo)
     pdir = pool_dir(repo, root)
     branch = f"tokendance/{holder}"
+    # Slots whose path a live session still occupies (e.g. a human-driven td-*
+    # tmux window): never reuse them, git worktree allows one checkout per slot.
+    busy = {os.path.abspath(p) for p in (busy_paths or [])}
     with state_lock(pdir):
         state = load_state(pdir)
         _heal(repo, pdir, state)
@@ -213,6 +216,7 @@ def acquire(repo, holder, root=None):
         ref = default_ref(repo)
         slot = next((e for e in state["entries"]
                      if not e["leased"] and os.path.isdir(e["path"])
+                     and os.path.abspath(e["path"]) not in busy
                      and not is_dirty(e["path"])), None)
         if slot is None:
             if len(state["entries"]) >= max_trees(root):
@@ -399,6 +403,8 @@ def main(argv=None):
     ap.add_argument("--root", default=None)
     sub = ap.add_subparsers(dest="cmd", required=True)
     a = sub.add_parser("acquire"); a.add_argument("--repo", required=True); a.add_argument("--holder", required=True)
+    a.add_argument("--busy-path", action="append", default=None,
+                   help="a slot path a live session occupies; never reuse it (repeatable)")
     rl = sub.add_parser("release"); rl.add_argument("--repo", required=True); rl.add_argument("--path", required=True)
     rl.add_argument("--expected-holder", default=None)
     st = sub.add_parser("status"); st.add_argument("--repo", required=True)
@@ -407,7 +413,7 @@ def main(argv=None):
     gt.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
     if args.cmd == "acquire":
-        print(acquire(args.repo, args.holder, root=args.root))
+        print(acquire(args.repo, args.holder, root=args.root, busy_paths=args.busy_path))
     elif args.cmd == "release":
         release(args.repo, args.path, root=args.root, expected_holder=args.expected_holder)
     elif args.cmd == "status":

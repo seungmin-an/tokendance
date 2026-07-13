@@ -249,6 +249,37 @@ class AcquireReleaseTest(unittest.TestCase):
         p2 = pool.acquire(self.repo, "task-2", root=self.tmp)
         self.assertNotEqual(p1, p2)
 
+    def test_acquire_skips_busy_slot_and_makes_new(self):
+        # An idle slot whose path a live session still occupies must NOT be reused;
+        # acquire creates a fresh slot instead (git worktree = one checkout per slot).
+        p1 = pool.acquire(self.repo, "task-1", root=self.tmp)
+        pool.release(self.repo, p1, root=self.tmp)
+        p2 = pool.acquire(self.repo, "task-2", root=self.tmp, busy_paths={p1})
+        self.assertNotEqual(p1, p2)
+        st = pool.load_state(pool.pool_dir(self.repo, self.tmp))
+        self.assertEqual(len(st["entries"]), 2)   # busy slot left alone, new one added
+
+    def test_acquire_busy_path_not_matching_reuses_idle(self):
+        p1 = pool.acquire(self.repo, "task-1", root=self.tmp)
+        pool.release(self.repo, p1, root=self.tmp)
+        p2 = pool.acquire(self.repo, "task-2", root=self.tmp,
+                          busy_paths={"/some/other/path"})
+        self.assertEqual(p1, p2)   # busy set irrelevant → warm reuse
+
+    def test_acquire_busy_only_slot_at_cap_raises(self):
+        with open(os.path.join(self.tmp, "config.local.md"), "w") as f:
+            f.write("POOL_MAX_TREES=1\n")
+        p1 = pool.acquire(self.repo, "task-1", root=self.tmp)
+        pool.release(self.repo, p1, root=self.tmp)
+        with self.assertRaises(RuntimeError):   # only slot is busy, can't grow → no slot
+            pool.acquire(self.repo, "task-2", root=self.tmp, busy_paths={p1})
+
+    def test_acquire_busy_paths_none_is_default_behavior(self):
+        p1 = pool.acquire(self.repo, "task-1", root=self.tmp)
+        pool.release(self.repo, p1, root=self.tmp)
+        p2 = pool.acquire(self.repo, "task-2", root=self.tmp)   # busy_paths omitted
+        self.assertEqual(p1, p2)
+
     def test_pool_full_raises(self):
         # cap the pool at 1 via config.local.md
         with open(os.path.join(self.tmp, "config.local.md"), "w") as f:
@@ -311,6 +342,14 @@ class CliTest(unittest.TestCase):
         s = self._run("status", "--repo", self.repo)
         self.assertIn("task-1", s.stdout)
         self.assertIn("leased", s.stdout)
+
+    def test_cli_acquire_busy_path_skips_slot(self):
+        p1 = self._run("acquire", "--repo", self.repo, "--holder", "task-1").stdout.strip().splitlines()[-1]
+        self._run("release", "--repo", self.repo, "--path", p1)
+        r = self._run("acquire", "--repo", self.repo, "--holder", "task-2", "--busy-path", p1)
+        self.assertEqual(r.returncode, 0, r.stderr)   # option must be recognized
+        p2 = r.stdout.strip().splitlines()[-1]
+        self.assertNotEqual(p1, p2)   # busy slot skipped → fresh slot
 
     def test_cli_release_frees_slot(self):
         p = self._run("acquire", "--repo", self.repo, "--holder", "task-1").stdout.strip().splitlines()[-1]
