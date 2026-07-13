@@ -440,6 +440,8 @@ class OpenTest(unittest.TestCase):
                 os.makedirs(td_dir, exist_ok=True)
                 with open(os.path.join(td_dir, "worktree.path"), "w") as f:
                     f.write(self.wt + "\n")
+            if "list-sessions" in cmd or "list-panes" in cmd:
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")  # no other sessions
             return types.SimpleNamespace(returncode=0, stdout=self.wt + "\n", stderr="")
 
         return calls, runner
@@ -535,6 +537,62 @@ class OpenTest(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             td.main(["help"])
         self.assertIn("open", buf.getvalue())
+
+    def test_open_aborts_when_worktree_busy_by_other_session(self):
+        # Belt-and-suspenders: a slot the pool wrongly re-handed while a live
+        # (non-own) tmux session still sits in it must be refused, not overwritten.
+        def runner(cmd, **k):
+            if any("prepare-worktree.sh" in str(c) for c in cmd):
+                td_dir = S.task_dir(self.tmp, "t-open")
+                os.makedirs(td_dir, exist_ok=True)
+                with open(os.path.join(td_dir, "worktree.path"), "w") as f:
+                    f.write(self.wt + "\n")
+                return types.SimpleNamespace(returncode=0, stdout=self.wt + "\n", stderr="")
+            if "list-sessions" in cmd:
+                return types.SimpleNamespace(returncode=0, stdout="td-intruder\n", stderr="")
+            if "list-panes" in cmd:
+                return types.SimpleNamespace(returncode=0, stdout=self.wt + "\n", stderr="")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        calls = []
+        wrapped = lambda cmd, **k: (calls.append(cmd), runner(cmd, **k))[1]
+        with self.assertRaises(SystemExit) as ctx:
+            td.cmd_open(self.tmp, "/r", "d", task_id="t-open", claude_bin="/fake/claude",
+                        runner=wrapped, which=lambda _: "/fake/tmux", recall_fn=lambda *a: "")
+        self.assertNotEqual(ctx.exception.code, 0)
+        self.assertFalse([c for c in calls if "new-session" in c])   # aborted before launch
+
+
+class GuardBusyWorktreeTest(unittest.TestCase):
+    """td._worktree_busy_by_other_session — refuse a worktree a live non-own tmux
+    session occupies (git worktree = one checkout per slot)."""
+
+    def _runner(self, sessions, panes, sessions_rc=0):
+        def runner(cmd, **k):
+            if "list-sessions" in cmd:
+                return types.SimpleNamespace(returncode=sessions_rc,
+                                             stdout="\n".join(sessions), stderr="")
+            if "list-panes" in cmd:
+                sess = cmd[cmd.index("-t") + 1]
+                return types.SimpleNamespace(returncode=0,
+                                             stdout="\n".join(panes.get(sess, [])), stderr="")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        return runner
+
+    def test_busy_when_other_session_sits_on_worktree(self):
+        r = self._runner(["td-other"], {"td-other": ["/wt"]})
+        self.assertTrue(td._worktree_busy_by_other_session("tmux", "/wt", "me", r))
+
+    def test_own_session_is_ignored(self):
+        r = self._runner(["td-me"], {"td-me": ["/wt"]})
+        self.assertFalse(td._worktree_busy_by_other_session("tmux", "/wt", "me", r))
+
+    def test_not_busy_when_no_session_cwd_matches(self):
+        r = self._runner(["td-other"], {"td-other": ["/elsewhere"]})
+        self.assertFalse(td._worktree_busy_by_other_session("tmux", "/wt", "me", r))
+
+    def test_no_tmux_server_is_not_busy(self):
+        r = self._runner([], {}, sessions_rc=1)   # `tmux list-sessions` fails: no server
+        self.assertFalse(td._worktree_busy_by_other_session("tmux", "/wt", "me", r))
 
 
 class ReviewTest(unittest.TestCase):

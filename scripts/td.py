@@ -367,11 +367,45 @@ def _provision_session_worktree(root, repo, desc, task_id, cmd_name,
         print(f"td {cmd_name}: no worktree recorded for {task_id} ({wt or 'unrecorded'}) "
               f"— discard with 'td task abort {task_id}'", file=sys.stderr)
         raise SystemExit(1)
+    # Defensive: never check out / launch onto a slot a live (non-own) tmux session
+    # still occupies — a git worktree holds one checkout, so we'd corrupt that session.
+    if _worktree_busy_by_other_session(tmux, wt, task_id, runner):
+        print(f"td {cmd_name}: worktree {wt} for {task_id} is occupied by another live "
+              f"tmux session — refusing to overwrite it (discard with 'td task abort {task_id}')",
+              file=sys.stderr)
+        raise SystemExit(1)
     # Mint the session up front (like launch-worker) and record it; worker_pid stays
     # None (init default). resume tolerates a missing session file → clean fresh boot.
     sid = str(uuid.uuid4())
     S.update(root, task_id, {"worker_session_id": sid})
     return task_id, wt, sid, claude, tmux
+
+
+def _worktree_busy_by_other_session(tmux, wt, task_id, runner=subprocess.run):
+    """True if a live tmux session other than td-<task_id> has `wt` as a pane cwd.
+
+    A git worktree allows one checkout per slot, so provisioning onto a slot a
+    live session still occupies would corrupt it (the pool.py busy-path skip is
+    the primary guard; this is a defensive check before checkout/launch).
+    Best-effort: any tmux failure (e.g. no server) reads as not-busy."""
+    own = f"td-{task_id}"
+    wt_abs = os.path.abspath(wt)
+    sres = runner([tmux, "list-sessions", "-F", "#{session_name}"],
+                  capture_output=True, text=True)
+    if getattr(sres, "returncode", 1) != 0:
+        return False
+    for sess in (getattr(sres, "stdout", "") or "").splitlines():
+        sess = sess.strip()
+        if not sess or sess == own:
+            continue
+        pres = runner([tmux, "list-panes", "-t", sess, "-F", "#{pane_current_path}"],
+                      capture_output=True, text=True)
+        if getattr(pres, "returncode", 1) != 0:
+            continue
+        for p in (getattr(pres, "stdout", "") or "").splitlines():
+            if p.strip() and os.path.abspath(p.strip()) == wt_abs:
+                return True
+    return False
 
 
 def _tmux_launch(runner, tmux, session_name, wt, inner, cmd_name, task_id, repo=None):
