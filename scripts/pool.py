@@ -400,6 +400,7 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     a = sub.add_parser("acquire"); a.add_argument("--repo", required=True); a.add_argument("--holder", required=True)
     rl = sub.add_parser("release"); rl.add_argument("--repo", required=True); rl.add_argument("--path", required=True)
+    rl.add_argument("--expected-holder", default=None)
     st = sub.add_parser("status"); st.add_argument("--repo", required=True)
     dk = sub.add_parser("disk"); dk.add_argument("--repo", required=True)
     gt = sub.add_parser("gc-targets"); gt.add_argument("--repo", required=True)
@@ -408,7 +409,7 @@ def main(argv=None):
     if args.cmd == "acquire":
         print(acquire(args.repo, args.holder, root=args.root))
     elif args.cmd == "release":
-        release(args.repo, args.path, root=args.root)
+        release(args.repo, args.path, root=args.root, expected_holder=args.expected_holder)
     elif args.cmd == "status":
         for name, state_, holder, path in status(args.repo, root=args.root):
             print(f"{name}\t{state_}\t{holder}\t{path}")
