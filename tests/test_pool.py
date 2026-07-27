@@ -199,6 +199,52 @@ class ManifestTest(unittest.TestCase):
         self.assertTrue(os.path.islink(os.path.join(p2, "artifacts", "libtorch")))
 
 
+class ReleaseBusyTest(unittest.TestCase):
+    """release() must not reset a worktree a live session still occupies.
+
+    acquire has skipped busy slots since 2026-07-13, but release resets the
+    worktree unconditionally — so a stale-lease GC (or a reclaim carrying a stale
+    worktree.path) force-checks-out the base ref under a human's live session:
+    their HEAD moves off the branch they were on and `clean -fd` takes untracked
+    files with it. Reported 2026-07-27 ("점유중인 애의 head 가 바뀌면 안되는거잖아");
+    the slot-1 reflog shows it on 07-13 and again on 07-19.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.repo = _init_repo(os.path.join(self.tmp, "repo"))
+        self.wt = pool.acquire(self.repo, "holder-1", root=self.tmp)
+        subprocess.run(["git", "-C", self.wt, "checkout", "-q", "-B", "mywork"],
+                       check=True, capture_output=True)
+        with open(os.path.join(self.wt, "scratch.txt"), "w") as f:
+            f.write("work in progress")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _head(self):
+        return subprocess.run(["git", "-C", self.wt, "rev-parse", "--abbrev-ref", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()
+
+    def test_release_of_a_busy_slot_leaves_the_worktree_alone(self):
+        pool.release(self.repo, self.wt, root=self.tmp, busy_paths=[self.wt])
+        self.assertEqual(self._head(), "mywork")                               # HEAD untouched
+        self.assertTrue(os.path.exists(os.path.join(self.wt, "scratch.txt")))  # work untouched
+        entry = pool.load_state(pool.pool_dir(self.repo, self.tmp))["entries"][0]
+        self.assertFalse(entry["leased"])  # lease still freed — only the reset is skipped
+
+    def test_release_of_an_idle_slot_still_resets(self):
+        pool.release(self.repo, self.wt, root=self.tmp)
+        self.assertEqual(self._head(), "HEAD")                                 # detached at base
+        self.assertFalse(os.path.exists(os.path.join(self.wt, "scratch.txt")))
+
+    def test_reclaim_stale_forwards_busy_paths(self):
+        pool.reclaim_stale(self.repo, root=self.tmp, keep_holders=set(),
+                           busy_paths=[self.wt])
+        self.assertEqual(self._head(), "mywork")
+        self.assertTrue(os.path.exists(os.path.join(self.wt, "scratch.txt")))
+
+
 def _branch(wt):
     return subprocess.run(["git", "-C", wt, "rev-parse", "--abbrev-ref", "HEAD"],
                           capture_output=True, text=True).stdout.strip()

@@ -113,10 +113,11 @@ class PoolMaintenanceTest(unittest.TestCase):
         # Patch reclaim_stale so it raises for repo_a but works normally for repo_b.
         repo_a_abs = os.path.abspath(repo_a)
         _real_reclaim = pool.reclaim_stale
-        def _faulty_reclaim(repo, root=None, keep_holders=None):
+        def _faulty_reclaim(repo, root=None, keep_holders=None, busy_paths=None):
             if os.path.abspath(repo) == repo_a_abs:
                 raise RuntimeError("simulated corrupt repo")
-            return _real_reclaim(repo, root=root, keep_holders=keep_holders or set())
+            return _real_reclaim(repo, root=root, keep_holders=keep_holders or set(),
+                                 busy_paths=busy_paths)
         with patch.object(pool, "reclaim_stale", _faulty_reclaim):
             # Inject both repos via tasks so pool_maintenance includes repo_a.
             tasks = [{"id": "x", "repo": repo_a}, {"id": "y", "repo": repo_b}]
