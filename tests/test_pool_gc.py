@@ -106,6 +106,31 @@ class GcTargetsTest(unittest.TestCase):
         pool.gc_targets(self.repo, root=self.tmp)
         self.assertTrue(os.path.exists(os.path.join(p, "target")))  # leased → untouched
 
+    # A slot can be unleased and still occupied by a live human session (a td-*
+    # tmux review window sits in a worktree whose lease was already freed). Both
+    # eviction tiers pick candidates by `leased == False` alone, so without a busy
+    # guard they delete the target/ out from under that session — same bug class as
+    # release/reclaim_stale, fixed there 2026-07-27.
+
+    def test_idle_sweep_skips_a_slot_a_live_session_occupies(self):
+        self._cfg(POOL_TARGET_IDLE_DAYS=10, POOL_MAX_TREES=4)
+        busy, other = self._idle_slots([("t-busy", 1000, 30), ("t-other", 1000, 30)])
+        pool.gc_targets(self.repo, root=self.tmp, busy_paths=[busy])
+        self.assertTrue(os.path.exists(os.path.join(busy, "target")))    # live session survives
+        self.assertFalse(os.path.exists(os.path.join(other, "target")))  # idle still evicted
+
+    def test_size_cap_skips_a_slot_a_live_session_occupies(self):
+        # cap ~3221 bytes / lowwater ~2576, as in the size-cap test above
+        self._cfg(POOL_TARGET_IDLE_DAYS=0, POOL_TARGET_MAX_GB=0.000003, POOL_MAX_TREES=4)
+        busy, cold, warm = self._idle_slots(
+            [("busy", 2000, 5), ("cold", 2000, 3), ("warm", 2000, 1)])
+        pool.gc_targets(self.repo, root=self.tmp, busy_paths=[busy])
+        # busy is the coldest — LRU would evict it first, but it is out of the running
+        self.assertTrue(os.path.exists(os.path.join(busy, "target")))
+        # the remaining 4000 bytes still exceed the cap → coldest candidate goes
+        self.assertFalse(os.path.exists(os.path.join(cold, "target")))
+        self.assertTrue(os.path.exists(os.path.join(warm, "target")))
+
     def test_dry_run_frees_nothing(self):
         self._cfg(POOL_TARGET_IDLE_DAYS=1)
         p, = self._idle_slots([("t", 1000, 9)])

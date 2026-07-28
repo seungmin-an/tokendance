@@ -350,7 +350,14 @@ def _evict_target(slot_path, idle_days, root=None):
     return freed
 
 
-def gc_targets(repo, root=None, *, now=None, dry_run=False):
+def gc_targets(repo, root=None, *, now=None, dry_run=False, busy_paths=None):
+    """Evict slot target/ dirs: tier 1 by idle age, tier 2 by size cap (coldest first).
+
+    `busy_paths` lists slot paths a live session still occupies (same contract as
+    acquire/release). Such a slot can be unleased — a human's td-* session outlives
+    its lease — and evicting its target/ deletes a build cache out from under them,
+    so it is excluded from the candidate set exactly like a leased slot.
+    """
     if now is None:
         now = time.time()
     repo = os.path.abspath(repo)
@@ -358,14 +365,15 @@ def gc_targets(repo, root=None, *, now=None, dry_run=False):
     idle_days = config.get_int("POOL_TARGET_IDLE_DAYS", r=root)
     max_gb = _cfg_float("POOL_TARGET_MAX_GB", root)
     low_gb = _cfg_float("POOL_TARGET_LOWWATER_GB", root) or (max_gb * 0.8)
+    busy = {os.path.abspath(p) for p in (busy_paths or [])}
     acts = []
     with state_lock(pdir):
         state = load_state(pdir)
         _heal(repo, pdir, state)
-        # idle (unleased) slots with an existing target/, in state order
+        # idle (unleased, unoccupied) slots with an existing target/, in state order
         cand = []
         for e in state["entries"]:
-            if e["leased"]:
+            if e["leased"] or os.path.abspath(e["path"]) in busy:
                 continue
             td = target_dir(e)
             if not os.path.isdir(td):
@@ -430,6 +438,9 @@ def main(argv=None):
     dk = sub.add_parser("disk"); dk.add_argument("--repo", required=True)
     gt = sub.add_parser("gc-targets"); gt.add_argument("--repo", required=True)
     gt.add_argument("--dry-run", action="store_true")
+    gt.add_argument("--busy-path", action="append", default=None,
+                    help="a slot path a live session occupies; never evict its "
+                         "target/ (repeatable)")
     args = ap.parse_args(argv)
     if args.cmd == "acquire":
         print(acquire(args.repo, args.holder, root=args.root, busy_paths=args.busy_path))
@@ -446,7 +457,8 @@ def main(argv=None):
                   f"{s['holder']}\t{s['target_bytes']}\t{s['path']}")
         print(f"TOTAL\t{rep['total_bytes']}")
     elif args.cmd == "gc-targets":
-        acts = gc_targets(args.repo, root=args.root, dry_run=args.dry_run)
+        acts = gc_targets(args.repo, root=args.root, dry_run=args.dry_run,
+                          busy_paths=args.busy_path)
         freed = 0
         for a in acts:
             print(f"{a['name']}\t{a['reason']}\t{a['freed_bytes']}")

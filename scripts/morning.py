@@ -403,7 +403,8 @@ def live_session_paths(runner=subprocess.run):
     """Worktree paths a live td-* tmux session currently sits in.
 
     Handed to reclaim_stale so that reclaiming an orphan-looking lease frees the
-    lease without resetting a tree a human is still working in. Best-effort: no
+    lease without resetting a tree a human is still working in, and to gc_targets
+    so its two eviction tiers leave that tree's target/ alone. Best-effort: no
     tmux / no server → empty list (pool.py itself stays tmux-free)."""
     def _out(*args):
         try:
@@ -503,7 +504,8 @@ def pool_maintenance(root, tasks, *, now, log=lambda m: None, dry_run=False):
                 reclaimed += POOL.reclaim_stale(repo, root=root,
                                                 keep_holders=keep.get(repo, set()),
                                                 busy_paths=busy)
-            target_actions += POOL.gc_targets(repo, root=root, now=now, dry_run=dry_run)
+            target_actions += POOL.gc_targets(repo, root=root, now=now, dry_run=dry_run,
+                                              busy_paths=busy)
             disk[repo] = POOL.disk_report(repo, root=root)["total_bytes"]
         except Exception as e:
             log(f"pool 정리 실패 ({os.path.basename(repo)}): {e}")
