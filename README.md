@@ -90,7 +90,7 @@ python3 scripts/tasks.py archive <id>         # 종료(done/failed) task 를 sta
 `archive` 는 종료 상태(done/failed)만 허용(활성 task 보호). worktree 는 **추적 파일 미커밋 변경이
 없으면** 제거하고 이동한다(커밋은 브랜치에 남으니 안전; untracked 산출물만 버림). 미커밋 변경이
 있으면 거부(진짜 unsaved 보호). **브랜치는 건드리지 않는다** — 미푸시 커밋 손실 방지.
-머지된 브랜치 GC + 일일 다이제스트는 `morning.py` 가 매일 수행.
+머지된 브랜치 GC + fork master ← upstream ff sync + 일일 다이제스트는 `morning.py` 가 매일 수행.
 
 ### 파일 레이아웃
 ```
