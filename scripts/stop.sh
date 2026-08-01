@@ -2,6 +2,9 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PIDFILE="$ROOT/state/supervisor.pid"
+# 의도적 정지 마커: watchdog.py 가 이걸 보면 되살리지 않는다(start.sh 가 지운다).
+mkdir -p "$ROOT/state"
+touch "$ROOT/state/supervisor.stopped"
 [ -f "$PIDFILE" ] || { echo "실행 중 아님"; exit 0; }
 PID="$(cat "$PIDFILE")"
 # 래퍼는 setsid 로 자기 프로세스그룹 리더(pgid==pid)다. 그룹째 SIGTERM →
