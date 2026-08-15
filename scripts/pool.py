@@ -275,9 +275,19 @@ def acquire(repo, holder, root=None, busy_paths=None):
         return slot["path"]
 
 
-def release(repo, path, root=None, *, expected_holder=None):
+def release(repo, path, root=None, *, expected_holder=None, busy_paths=None):
+    """Free a slot's lease and reset its worktree for the next holder.
+
+    `busy_paths` lists slot paths a live session still occupies (same contract as
+    acquire). For those the lease is freed but the worktree is left exactly as it
+    is: reset_worktree force-checks-out the base ref and runs `clean -fd`, which
+    under a live human session yanks HEAD off the branch they are working on and
+    deletes their untracked files. acquire already refuses to hand out a busy
+    slot, so freeing the lease alone cannot let anyone else in.
+    """
     repo = os.path.abspath(repo)
     pdir = pool_dir(repo, root)
+    busy = {os.path.abspath(p) for p in (busy_paths or [])}
     with state_lock(pdir):
         state = load_state(pdir)
         ref = default_ref(repo)
@@ -285,7 +295,10 @@ def release(repo, path, root=None, *, expected_holder=None):
             if os.path.abspath(e["path"]) == os.path.abspath(path):
                 if expected_holder is not None and e.get("lease_holder", "") != expected_holder:
                     return  # stale snapshot: slot re-acquired by someone else; leave it
-                if os.path.isdir(e["path"]):
+                if os.path.abspath(e["path"]) in busy:
+                    print(f"[pool] release: {e['path']} is occupied by a live session — "
+                          f"freeing the lease without resetting the worktree", file=sys.stderr)
+                elif os.path.isdir(e["path"]):
                     reset_worktree(e["path"], ref)
                 e["leased"] = False
                 e["lease_holder"] = ""
@@ -295,11 +308,13 @@ def release(repo, path, root=None, *, expected_holder=None):
         save_state(pdir, state)
 
 
-def reclaim_stale(repo, root=None, *, keep_holders):
+def reclaim_stale(repo, root=None, *, keep_holders, busy_paths=None):
     """Release leased slots whose holder is not in keep_holders. Returns reclaimed holders.
 
     keep_holders is the set of holder ids the CALLER deems still alive (fresh heartbeat /
-    active task). pool.py stays free of task-state knowledge — morning.py computes the set."""
+    active task). pool.py stays free of task-state knowledge — morning.py computes the set.
+    busy_paths is forwarded to release(): an orphan-looking lease may still have a live
+    human session sitting in its worktree, and reclaiming it must not reset that tree."""
     repo = os.path.abspath(repo)
     pdir = pool_dir(repo, root)
     with state_lock(pdir):
@@ -308,7 +323,8 @@ def reclaim_stale(repo, root=None, *, keep_holders):
                  if e["leased"] and e.get("lease_holder", "") not in keep_holders]
     reclaimed = []
     for e in stale:
-        release(repo, e["path"], root, expected_holder=e["lease_holder"])   # release takes its own lock; TOCTOU-safe
+        release(repo, e["path"], root, expected_holder=e["lease_holder"],
+                busy_paths=busy_paths)   # release takes its own lock; TOCTOU-safe
         reclaimed.append(e["lease_holder"])
     return reclaimed
 
@@ -371,7 +387,14 @@ def _evict_target(slot_path, idle_days, root=None):
     return freed
 
 
-def gc_targets(repo, root=None, *, now=None, dry_run=False):
+def gc_targets(repo, root=None, *, now=None, dry_run=False, busy_paths=None):
+    """Evict slot target/ dirs: tier 1 by idle age, tier 2 by size cap (coldest first).
+
+    `busy_paths` lists slot paths a live session still occupies (same contract as
+    acquire/release). Such a slot can be unleased — a human's td-* session outlives
+    its lease — and evicting its target/ deletes a build cache out from under them,
+    so it is excluded from the candidate set exactly like a leased slot.
+    """
     if now is None:
         now = time.time()
     repo = os.path.abspath(repo)
@@ -379,14 +402,15 @@ def gc_targets(repo, root=None, *, now=None, dry_run=False):
     idle_days = config.get_int("POOL_TARGET_IDLE_DAYS", r=root)
     max_gb = _cfg_float("POOL_TARGET_MAX_GB", root)
     low_gb = _cfg_float("POOL_TARGET_LOWWATER_GB", root) or (max_gb * 0.8)
+    busy = {os.path.abspath(p) for p in (busy_paths or [])}
     acts = []
     with state_lock(pdir):
         state = load_state(pdir)
         _heal(repo, pdir, state)
-        # idle (unleased) slots with an existing target/, in state order
+        # idle (unleased, unoccupied) slots with an existing target/, in state order
         cand = []
         for e in state["entries"]:
-            if e["leased"]:
+            if e["leased"] or os.path.abspath(e["path"]) in busy:
                 continue
             td = target_dir(e)
             if not os.path.isdir(td):
@@ -444,15 +468,22 @@ def main(argv=None):
                    help="a slot path a live session occupies; never reuse it (repeatable)")
     rl = sub.add_parser("release"); rl.add_argument("--repo", required=True); rl.add_argument("--path", required=True)
     rl.add_argument("--expected-holder", default=None)
+    rl.add_argument("--busy-path", action="append", default=None,
+                    help="a slot path a live session occupies; free the lease but do not "
+                         "reset its worktree (repeatable)")
     st = sub.add_parser("status"); st.add_argument("--repo", required=True)
     dk = sub.add_parser("disk"); dk.add_argument("--repo", required=True)
     gt = sub.add_parser("gc-targets"); gt.add_argument("--repo", required=True)
     gt.add_argument("--dry-run", action="store_true")
+    gt.add_argument("--busy-path", action="append", default=None,
+                    help="a slot path a live session occupies; never evict its "
+                         "target/ (repeatable)")
     args = ap.parse_args(argv)
     if args.cmd == "acquire":
         print(acquire(args.repo, args.holder, root=args.root, busy_paths=args.busy_path))
     elif args.cmd == "release":
-        release(args.repo, args.path, root=args.root, expected_holder=args.expected_holder)
+        release(args.repo, args.path, root=args.root, expected_holder=args.expected_holder,
+                busy_paths=args.busy_path)
     elif args.cmd == "status":
         for name, state_, holder, path in status(args.repo, root=args.root):
             print(f"{name}\t{state_}\t{holder}\t{path}")
@@ -463,7 +494,8 @@ def main(argv=None):
                   f"{s['holder']}\t{s['target_bytes']}\t{s['path']}")
         print(f"TOTAL\t{rep['total_bytes']}")
     elif args.cmd == "gc-targets":
-        acts = gc_targets(args.repo, root=args.root, dry_run=args.dry_run)
+        acts = gc_targets(args.repo, root=args.root, dry_run=args.dry_run,
+                          busy_paths=args.busy_path)
         freed = 0
         for a in acts:
             print(f"{a['name']}\t{a['reason']}\t{a['freed_bytes']}")
