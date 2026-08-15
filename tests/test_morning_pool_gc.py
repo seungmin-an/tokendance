@@ -101,6 +101,18 @@ class PoolMaintenanceTest(unittest.TestCase):
                   pool.load_state(pool.pool_dir(self.repo, self.tmp))["entries"] if e["leased"]}
         self.assertEqual(leased, set())
 
+    def test_pool_maintenance_passes_live_session_paths_to_gc_targets(self):
+        """Target GC must see the same live-session paths reclaim already gets."""
+        seen = {}
+        def _stub_gc(repo, root=None, now=None, dry_run=False, busy_paths=None):
+            seen["busy_paths"] = busy_paths
+            return []
+        with patch.object(M, "live_session_paths", lambda: ["/pool/repo/1"]), \
+             patch.object(pool, "gc_targets", _stub_gc):
+            M.pool_maintenance(self.tmp, [{"id": "x", "repo": self.repo}],
+                               now=time.time(), log=lambda m: None)
+        self.assertEqual(seen["busy_paths"], ["/pool/repo/1"])
+
     def test_pool_maintenance_resilient_bad_repo(self):
         """C1 resilience: bad repo A does not abort maintenance; good repo B is reclaimed."""
         repo_a = _init_repo(os.path.join(self.tmp, "repo_a"))
@@ -113,10 +125,11 @@ class PoolMaintenanceTest(unittest.TestCase):
         # Patch reclaim_stale so it raises for repo_a but works normally for repo_b.
         repo_a_abs = os.path.abspath(repo_a)
         _real_reclaim = pool.reclaim_stale
-        def _faulty_reclaim(repo, root=None, keep_holders=None):
+        def _faulty_reclaim(repo, root=None, keep_holders=None, busy_paths=None):
             if os.path.abspath(repo) == repo_a_abs:
                 raise RuntimeError("simulated corrupt repo")
-            return _real_reclaim(repo, root=root, keep_holders=keep_holders or set())
+            return _real_reclaim(repo, root=root, keep_holders=keep_holders or set(),
+                                 busy_paths=busy_paths)
         with patch.object(pool, "reclaim_stale", _faulty_reclaim):
             # Inject both repos via tasks so pool_maintenance includes repo_a.
             tasks = [{"id": "x", "repo": repo_a}, {"id": "y", "repo": repo_b}]

@@ -199,6 +199,123 @@ class ManifestTest(unittest.TestCase):
         self.assertTrue(os.path.islink(os.path.join(p2, "artifacts", "libtorch")))
 
 
+class ReleaseBusyTest(unittest.TestCase):
+    """release() must not reset a worktree a live session still occupies.
+
+    acquire has skipped busy slots since 2026-07-13, but release resets the
+    worktree unconditionally — so a stale-lease GC (or a reclaim carrying a stale
+    worktree.path) force-checks-out the base ref under a human's live session:
+    their HEAD moves off the branch they were on and `clean -fd` takes untracked
+    files with it. Reported 2026-07-27 ("점유중인 애의 head 가 바뀌면 안되는거잖아");
+    the slot-1 reflog shows it on 07-13 and again on 07-19.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.repo = _init_repo(os.path.join(self.tmp, "repo"))
+        self.wt = pool.acquire(self.repo, "holder-1", root=self.tmp)
+        subprocess.run(["git", "-C", self.wt, "checkout", "-q", "-B", "mywork"],
+                       check=True, capture_output=True)
+        with open(os.path.join(self.wt, "scratch.txt"), "w") as f:
+            f.write("work in progress")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _head(self):
+        return subprocess.run(["git", "-C", self.wt, "rev-parse", "--abbrev-ref", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()
+
+    def test_release_of_a_busy_slot_leaves_the_worktree_alone(self):
+        pool.release(self.repo, self.wt, root=self.tmp, busy_paths=[self.wt])
+        self.assertEqual(self._head(), "mywork")                               # HEAD untouched
+        self.assertTrue(os.path.exists(os.path.join(self.wt, "scratch.txt")))  # work untouched
+        entry = pool.load_state(pool.pool_dir(self.repo, self.tmp))["entries"][0]
+        self.assertFalse(entry["leased"])  # lease still freed — only the reset is skipped
+
+    def test_release_of_an_idle_slot_still_resets(self):
+        pool.release(self.repo, self.wt, root=self.tmp)
+        self.assertEqual(self._head(), "HEAD")                                 # detached at base
+        self.assertFalse(os.path.exists(os.path.join(self.wt, "scratch.txt")))
+
+    def test_reclaim_stale_forwards_busy_paths(self):
+        pool.reclaim_stale(self.repo, root=self.tmp, keep_holders=set(),
+                           busy_paths=[self.wt])
+        self.assertEqual(self._head(), "mywork")
+        self.assertTrue(os.path.exists(os.path.join(self.wt, "scratch.txt")))
+
+
+class DirtyIgnoreTest(unittest.TestCase):
+    """A slot must not look dirty because of the shares tokendance itself injects.
+
+    npu-tools does not gitignore .venv, so the symlink apply_shared_symlinks
+    creates at acquire shows up as `?? .venv` — and acquire skips dirty slots, so
+    that slot was never reusable again ("pool full" with idle slots). The repos in
+    the other fixtures gitignore .venv, which is why this stayed invisible.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.repo = _init_repo(os.path.join(self.tmp, "repo"))
+        self._commit_gitignore("target/\n")   # mirror npu-tools: .venv NOT ignored
+        os.makedirs(os.path.join(self.repo, ".venv", "bin"))
+        self.wt = os.path.join(self.tmp, "wt")
+        pool.add_worktree(self.repo, self.wt, pool.default_ref(self.repo))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _commit_gitignore(self, body):
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        with open(os.path.join(self.repo, ".gitignore"), "w") as f:
+            f.write(body)
+        for a in (("add", "-A"), ("commit", "-q", "-m", "gitignore")):
+            subprocess.run(["git", "-C", self.repo, *a], check=True,
+                           capture_output=True, text=True, env=env)
+
+    def test_injected_share_alone_is_not_dirty(self):
+        pool.apply_shared_symlinks(self.repo, self.wt, root=self.tmp)
+        self.assertTrue(pool.is_dirty(self.wt))                 # untracked to git…
+        self.assertFalse(pool.is_dirty(self.wt, [".venv"]))     # …but ours, not user work
+
+    def test_real_user_work_is_still_dirty(self):
+        pool.apply_shared_symlinks(self.repo, self.wt, root=self.tmp)
+        with open(os.path.join(self.wt, "scratch.txt"), "w") as f:
+            f.write("real work")
+        self.assertTrue(pool.is_dirty(self.wt, [".venv"]))
+
+    def test_manifest_child_links_are_ignored(self):
+        # tracked dir whose gitignored children get linked by the child-level merge
+        src = os.path.join(self.repo, "artifacts", "lt")
+        os.makedirs(src)
+        with open(os.path.join(src, "lt.dvc"), "w") as f:
+            f.write("pointer")
+        with open(os.path.join(self.repo, ".tokendance-worktree.manifest"), "w") as f:
+            f.write("artifacts/lt\n")
+        self._commit_gitignore("target/\n")   # picks up artifacts/lt/lt.dvc too
+        os.makedirs(os.path.join(src, "current"))
+        wt2 = os.path.join(self.tmp, "wt2")
+        pool.add_worktree(self.repo, wt2, pool.default_ref(self.repo))
+        pool.apply_worktree_manifest(self.repo, wt2)
+        self.assertTrue(os.path.islink(os.path.join(wt2, "artifacts", "lt", "current")))
+        self.assertTrue(pool.is_dirty(wt2))
+        self.assertFalse(pool.is_dirty(wt2, ["artifacts/lt"]))
+
+    def test_injected_paths_unions_shares_and_manifest(self):
+        with open(os.path.join(self.repo, ".tokendance-worktree.manifest"), "w") as f:
+            f.write("artifacts/lt\n")
+        self.assertEqual(pool.injected_paths(self.repo, root=self.tmp),
+                         {".venv", "artifacts/lt"})
+
+    def test_acquire_reuses_a_released_slot_that_kept_the_share(self):
+        p1 = pool.acquire(self.repo, "task-1", root=self.tmp)
+        pool.release(self.repo, p1, root=self.tmp)
+        # release resets the slot; re-inject the share as a mid-lease clean would leave it
+        pool.apply_shared_symlinks(self.repo, p1, root=self.tmp)
+        self.assertEqual(pool.acquire(self.repo, "task-2", root=self.tmp), p1)
+
+
 def _branch(wt):
     return subprocess.run(["git", "-C", wt, "rev-parse", "--abbrev-ref", "HEAD"],
                           capture_output=True, text=True).stdout.strip()
