@@ -22,6 +22,7 @@ tokendance 레포는 **컨트롤 플레인**일 뿐, 워커는 **임의의 타�
 - claude 바이너리: 환경변수 `TOKENDANCE_CLAUDE`.
 - root 실행이라 claude 기동 시 `IS_SANDBOX=1` + `--dangerously-skip-permissions` 필요.
 - supervisor 기동/정지: `scripts/start.sh` / `scripts/stop.sh`. start.sh 는 `scripts/supervise.sh` keepalive 래퍼를 `setsid` 로 띄우고(래퍼 pid=`supervisor.pid`, 프로세스그룹 리더), 래퍼가 supervisor.py 가 죽으면 자동 재기동한다(빠른 크래시 백오프, `state/supervisor.lock` flock 로 중복 방지). stop.sh 는 그룹째 종료한다.
+- 워치독: `scripts/watchdog.py`(별도 프로세스그룹 상주 루프, 60초). supervise.sh 는 supervisor.py 의 **크래시**만 복구하고 **래퍼 자체가 사라진 경우**(stop 후 재기동 누락 등)는 아무도 복구하지 않는다 — 이 루프가 그 구멍을 막는다. 판정은 **래퍼 프로세스 생존**뿐(tick 신선도는 안 씀 — 사서 13~15분·`run_master` 무타임아웃 블로킹이 정상이라 죽음과 구분 불가). 죽었으면 `start.sh` 를 돌리고 Slack 으로 알린다(엣지 트리거). `stop.sh` 가 남기는 `state/supervisor.stopped` 마커가 있으면 되살리지 않고, `start.sh` 가 그 마커를 지운다. 기동: `setsid nohup python3 scripts/watchdog.py >/dev/null 2>&1 &` (env 에 `TOKENDANCE_CLAUDE` 필요), 중지: `kill $(cat state/watchdog.pid)`.
 - supervisor 관측성: `state/supervisor.ticks.jsonl`(tick 당 JSON; 5MB 초과 시 `.jsonl.1` 로 회전, 디스크 bounded), `state/supervisor.metrics.json`(요약 스냅샷; `python3 scripts/supervisor.py metrics`), `state/supervisor.respawn.log`(재기동 이벤트). 모두 `state/` 라 git 추적 안 함.
 
 ## 사서(librarian) — 지식 큐레이션 패스

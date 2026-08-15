@@ -4,6 +4,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${TOKENDANCE_CLAUDE:?TOKENDANCE_CLAUDE 미설정}"
 PIDFILE="$ROOT/state/supervisor.pid"
 mkdir -p "$ROOT/state"
+rm -f "$ROOT/state/supervisor.stopped"   # 의도적 정지 해제 → watchdog.py 감시 재개
 if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
   echo "이미 실행 중: $(cat "$PIDFILE")"; exit 0
 fi

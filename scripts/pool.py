@@ -79,9 +79,35 @@ def default_ref(repo):
     return git(repo, "rev-parse", "HEAD").stdout.strip()
 
 
-def is_dirty(wt):
+def _porcelain_path(line):
+    """Repo-relative path out of one `status --porcelain` line ("?? .venv")."""
+    p = line[3:]
+    if " -> " in p:  # rename/copy: judge by the destination
+        p = p.split(" -> ", 1)[1]
+    if p.startswith('"') and p.endswith('"'):
+        p = p[1:-1]
+    return p.rstrip("/")
+
+
+def is_dirty(wt, ignore=()):
+    """True if the worktree holds work worth preserving.
+
+    `ignore` lists repo-relative paths tokendance itself injects (see
+    injected_paths): entries there — and their children — are our shares, not the
+    user's work. Without that filter a repo which does not gitignore the share
+    (npu-tools and .venv) reports `?? .venv` right after acquire wired it up, so
+    the slot reads dirty forever and acquire never reuses it.
+    """
     r = git(wt, "status", "--porcelain", "--untracked-files=all")
-    return bool(r.stdout.strip())
+    ignored = [i.strip("/") for i in ignore if i.strip("/")]
+    for line in r.stdout.splitlines():
+        if not line.strip():
+            continue
+        p = _porcelain_path(line)
+        if any(p == i or p.startswith(i + "/") for i in ignored):
+            continue
+        return True
+    return False
 
 
 def add_worktree(repo, path, ref):
@@ -92,7 +118,11 @@ def add_worktree(repo, path, ref):
 def reset_worktree(wt, ref):
     git(wt, "checkout", "--detach", "--force", ref)
     git(wt, "reset", "--hard", ref)
-    git(wt, "clean", "-fd")  # NOTE: no -x — preserves gitignored target/ + .venv symlink
+    # NOTE: no -x — preserves gitignored build state (target/). A share the repo
+    # does NOT gitignore (npu-tools and .venv) is untracked, so this does remove
+    # it; acquire re-applies the shares right after, and is_dirty() ignores them
+    # so a slot still carrying one stays reusable.
+    git(wt, "clean", "-fd")
 
 
 def shared_dirs(root=None):
@@ -123,6 +153,12 @@ def worktree_manifest(repo):
             return [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
     except FileNotFoundError:
         return []
+
+
+def injected_paths(repo, root=None):
+    """Repo-relative paths tokendance wires into every slot: the shared symlinks
+    plus the manifest entries. is_dirty() must not count these as user work."""
+    return set(shared_dirs(root)) | set(worktree_manifest(repo))
 
 
 def apply_worktree_manifest(repo, wt):
@@ -214,10 +250,11 @@ def acquire(repo, holder, root=None, busy_paths=None):
             return owned["path"]
         git(repo, "fetch", "origin", check=False)
         ref = default_ref(repo)
+        ignore = injected_paths(repo, root)
         slot = next((e for e in state["entries"]
                      if not e["leased"] and os.path.isdir(e["path"])
                      and os.path.abspath(e["path"]) not in busy
-                     and not is_dirty(e["path"])), None)
+                     and not is_dirty(e["path"], ignore)), None)
         if slot is None:
             if len(state["entries"]) >= max_trees(root):
                 raise RuntimeError(
