@@ -5,14 +5,18 @@
 기본 7시) 트리거한다. state/morning.last(KST 날짜)로 하루 중복을 막는다. librarian 과 달리
 **LLM 불필요 — 순수 파이썬**(판단이 거의 없음): GC 는 git/파일 조작, 다이제스트는 status 집계.
 
-두 가지를 한다:
+세 가지를 한다:
   1. 완료 worktree GC — done(또는 archived)이고 결과가 보존된(브랜치가 base 에 머지됐거나
      remote 에 push 된) task 의 worktree + 로컬 task 브랜치를 제거. 안전 최우선:
        - 비종료 상태(running/needs_human/review/queued/blocked) task 는 절대 안 건드림.
        - 현재 실행 중인 워커 자신(current_task_id)도 제외.
        - 결과 미보존이면 삭제하지 않고 다이제스트에 "정리 후보(수동확인)"로 표기.
        - worktree 회수는 scripts/reclaim-worktree.sh 를 통해 풀 슬롯을 반환한다. 멱등.
-  2. 일일 다이제스트 — 들고있는 작업(running/queued/review) + 사람 확인 필요(needs_human,
+  2. fork master ← upstream master **fast-forward** sync — 풀 워크트리의 base 는
+     refs/remotes/origin/HEAD(= fork 의 default 브랜치)이므로, fork 가 낡으면 모든 워커가
+     낡은 base 에서 출발한다. ff 가능할 때만 push 하고 **force 는 절대 쓰지 않는다**
+     (분기됐으면 보고만 → 사람 판단).
+  3. 일일 다이제스트 — 들고있는 작업(running/queued/review) + 사람 확인 필요(needs_human,
      대기사유 한 줄) + 정리 결과 + 최근 완료를 Slack 한 메시지로 보고.
 
 게이트(should_run)/last-run 은 librarian 과 같은 모양이되 idle 을 요구하지 않는다 — 다이제스트는
@@ -298,9 +302,25 @@ def _title_suffix(d):
     return f" — {title}" if title else ""
 
 
+def _fork_entry(r):
+    """fork sync 레코드 1건의 다이제스트 표기(레포당 한 조각)."""
+    name = os.path.basename(r.get("repo", "").rstrip("/")) or "?"
+    st = r.get("status")
+    if st == "synced":
+        prefix = "[dry-run] " if r.get("dry_run") else ""
+        return f"{name}: {prefix}{r['old']}→{r['new']} ({r.get('behind', 0)}커밋)"
+    if st == "up-to-date":
+        return f"{name}: 최신"
+    if st == "diverged":
+        return f"{name}: ⚠️ 분기됨 {r.get('ahead', 0)}커밋(push 안 함)"
+    if st == "skip":
+        return f"{name}: skip({r.get('detail') or '이유 미상'})"
+    return f"{name}: ⚠️ 실패({r.get('detail') or ''})"
+
+
 def build_digest(tasks, gc_actions, *, now_str,
                  note_fn=lambda d: d.get("failure_reason") or "",
-                 pool_res=None):
+                 pool_res=None, fork_res=None):
     """아침 다이제스트 텍스트(순수).
 
     작업을 3 분류로 묶어 보여준다(steer 2026-06-26):
@@ -382,6 +402,10 @@ def build_digest(tasks, gc_actions, *, now_str,
             L.append(f"  • ⚠️ 정리 실패: {', '.join(os.path.basename(r) for r in pool_res['failed'])}")
         for repo, b in sorted(pool_res["disk"].items()):
             L.append(f"  • {os.path.basename(repo)}: target {b // (1024 * 1024)} MiB")
+
+    if fork_res:
+        L.append("")
+        L.append("🔄 fork sync — " + " · ".join(_fork_entry(r) for r in fork_res))
 
     return "\n".join(L) + "\n"
 
@@ -483,6 +507,146 @@ def _repos_with_pools(root):
     return repos
 
 
+# ── fork master ← upstream master sync ──────────────────────────────────────
+# 풀 워크트리의 base 는 pool.default_ref() = refs/remotes/origin/HEAD = **fork 의 default
+# 브랜치**다. fork master 가 낡으면 모든 워커 태스크가 낡은 base 에서 출발하므로(2026-07-30
+# npu-tools 가 2808 커밋 뒤처져 rebase 비용을 냈다), 아침마다 upstream 과 ff sync 한다.
+# **force 는 어떤 경우에도 쓰지 않는다** — fork 에 고유 커밋이 있으면 보고만 하고 사람이 판단한다.
+
+FORK_SYNC_TIMEOUT = 600   # 초. 큰 레포의 첫 sync fetch 도 넉넉히 커버.
+
+
+def _git_net(cmd):
+    """fork sync 용 git 실행: 자격증명 프롬프트 금지 + 타임아웃.
+
+    morning 은 supervisor tick 안에서 인프로세스로 돌기 때문에, git 이 자격증명 프롬프트
+    (터미널 없음)나 네트워크에서 무한 대기하면 supervisor 루프 전체가 멈춘다. 둘 다 막는다.
+    TimeoutExpired 는 _out 이 rc=-1 로 정규화해 error 레코드가 된다.
+    """
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=FORK_SYNC_TIMEOUT,
+                          env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
+
+
+def _out(runner, cmd):
+    """(rc, stdout, stderr). runner 예외(타임아웃 등)는 rc=-1 로 정규화한다."""
+    try:
+        r = runner(cmd)
+        return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
+    except Exception as e:
+        return -1, "", str(e)
+
+
+def _remotes(repo, runner):
+    rc, out, _ = _out(runner, ["git", "-C", repo, "remote"])
+    return set(out.split()) if rc == 0 else set()
+
+
+def default_branch(repo, runner=_git_net):
+    """fork 의 default 브랜치 이름. 하드코딩하지 않고 symbolic-ref 에서 얻는다.
+
+    refs/remotes/origin/HEAD → 없으면 refs/remotes/upstream/HEAD. 둘 다 없으면 ""(호출자가 skip).
+    """
+    for remote in ("origin", "upstream"):
+        prefix = f"refs/remotes/{remote}/"
+        rc, out, _ = _out(runner, ["git", "-C", repo, "symbolic-ref", "--quiet", prefix + "HEAD"])
+        if rc == 0 and out.startswith(prefix):
+            return out[len(prefix):]
+    return ""
+
+
+def _short(repo, ref, runner):
+    rc, out, _ = _out(runner, ["git", "-C", repo, "rev-parse", "--short=7",
+                               "--verify", "--quiet", ref])
+    return out if rc == 0 else ""
+
+
+def _count(repo, rng, runner):
+    rc, out, _ = _out(runner, ["git", "-C", repo, "rev-list", "--count", rng])
+    return int(out) if rc == 0 and out.isdigit() else 0
+
+
+def _first_line(s):
+    return (s or "").splitlines()[0][:160] if s else ""
+
+
+def fork_sync_repo(repo, *, runner=_git_net, log=lambda m: None, dry_run=False):
+    """한 레포의 fork(origin) default 브랜치를 upstream 과 **fast-forward** sync 한다.
+
+    반환 레코드의 status:
+      skip        — origin/upstream remote 쌍이 없거나 default 브랜치를 못 얻음(아무것도 안 함)
+      up-to-date  — 이미 같음(no-op, 로그도 조용히)
+      synced      — origin/<b> 가 upstream/<b> 의 조상 → ff push 함(dry_run 이면 예정만 보고)
+      diverged    — fork 에 고유 커밋이 있어 ff 불가 → **push 하지 않고** 보고만(사람 판단)
+      error       — fetch/push 실패(네트워크·권한·타임아웃). 예외를 던지지 않는다.
+    """
+    rec = {"repo": repo, "status": "skip", "branch": "", "detail": "", "dry_run": dry_run}
+    if not {"origin", "upstream"} <= _remotes(repo, runner):
+        rec["detail"] = "origin+upstream remote 쌍 없음 → fork 아님"
+        return rec
+    b = default_branch(repo, runner)
+    if not b:
+        rec["detail"] = "default 브랜치 판별 실패(origin/HEAD·upstream/HEAD 없음)"
+        log(f"fork sync {os.path.basename(repo)}: {rec['detail']} — skip")
+        return rec
+    rec["branch"] = b
+    org_ref, ups_ref = f"refs/remotes/origin/{b}", f"refs/remotes/upstream/{b}"
+    for remote in ("upstream", "origin"):
+        # origin 도 fetch 한다 — 로컬 origin/<b> 가 낡으면 ancestor 판정·보고가 틀린다.
+        rc, _, err = _out(runner, ["git", "-C", repo, "fetch", remote, b])
+        if rc != 0:
+            rec["status"] = "error"
+            rec["detail"] = f"fetch {remote} 실패: {_first_line(err)}"
+            log(f"fork sync {os.path.basename(repo)}: {rec['detail']}")
+            return rec
+    rec["old"], rec["new"] = _short(repo, org_ref, runner), _short(repo, ups_ref, runner)
+    if not rec["old"] or not rec["new"]:
+        rec["status"] = "skip"
+        rec["detail"] = f"remote-tracking ref 없음(origin/{b} 또는 upstream/{b})"
+        log(f"fork sync {os.path.basename(repo)}: {rec['detail']} — skip")
+        return rec
+    if rec["old"] == rec["new"]:
+        rec["status"] = "up-to-date"
+        return rec
+    if not _ok(runner, ["git", "-C", repo, "merge-base", "--is-ancestor", org_ref, ups_ref]):
+        # fork 에 고유 커밋이 있다 → ff 불가. force 금지이므로 보고만 하고 사람이 판단한다.
+        rec["status"] = "diverged"
+        rec["ahead"] = _count(repo, f"{ups_ref}..{org_ref}", runner)
+        rec["detail"] = f"fork 고유 커밋 {rec['ahead']}개 — push 안 함(사람 확인 필요)"
+        log(f"fork sync {os.path.basename(repo)}: {rec['detail']}")
+        return rec
+    rec["behind"] = _count(repo, f"{org_ref}..{ups_ref}", runner)
+    prefix = "[dry-run] " if dry_run else ""
+    if not dry_run:
+        rc, _, err = _out(runner, ["git", "-C", repo, "push", "origin",
+                                   f"{ups_ref}:refs/heads/{b}"])
+        if rc != 0:
+            rec["status"] = "error"
+            rec["detail"] = f"push origin 실패: {_first_line(err)}"
+            log(f"fork sync {os.path.basename(repo)}: {rec['detail']}")
+            return rec
+    rec["status"] = "synced"
+    log(f"fork sync {os.path.basename(repo)}: {prefix}{b} {rec['old']}→{rec['new']} "
+        f"({rec['behind']}커밋 ff)")
+    return rec
+
+
+def fork_sync(root, tasks, *, runner=_git_net, log=lambda m: None, dry_run=False):
+    """tokendance 가 아는 레포들(tasks 의 repo ∪ 풀 보유 레포)의 fork 를 upstream 과 sync.
+
+    레포 단위로 예외를 잡아 다른 레포와 morning 나머지 단계를 죽이지 않는다(pool_maintenance 패턴).
+    """
+    repos = sorted({os.path.abspath(t["repo"]) for t in tasks if t.get("repo")}
+                   | _repos_with_pools(root))
+    out = []
+    for repo in repos:
+        try:
+            out.append(fork_sync_repo(repo, runner=runner, log=log, dry_run=dry_run))
+        except Exception as e:
+            log(f"fork sync 실패 ({os.path.basename(repo)}): {e}")
+            out.append({"repo": repo, "status": "error", "detail": str(e)})
+    return out
+
+
 def pool_maintenance(root, tasks, *, now, log=lambda m: None, dry_run=False):
     """Run stale-lease reclaim + target GC for each repo referenced in tasks.
 
@@ -548,12 +712,20 @@ def run_morning(root, now=None, post=True, runner=_run, log=_log, dry_run=False)
     tasks = TK.list_tasks(root)
     gc_actions = run_gc(root, tasks, runner=runner, log=log, dry_run=dry_run)
     try:
+        # runner 를 넘기지 않는다 — fork sync 는 네트워크를 타므로 프롬프트 금지 + 타임아웃이
+        # 걸린 _git_net 을 써야 한다(GC 용 runner 는 로컬 git 전용).
+        fork_res = fork_sync(root, tasks, log=log, dry_run=dry_run)
+    except Exception as e:
+        log(f"fork sync 전체 실패: {e}")
+        fork_res = None
+    try:
         pool_res = pool_maintenance(root, tasks, now=now.timestamp(), log=log, dry_run=dry_run)
     except Exception as e:
         log(f"pool 정리 전체 실패: {e}")
         pool_res = None
     text = build_digest(tasks, gc_actions, now_str=_kst_str(now),
-                        note_fn=lambda d: _note(root, d), pool_res=pool_res)
+                        note_fn=lambda d: _note(root, d), pool_res=pool_res,
+                        fork_res=fork_res)
     n_removed = sum(1 for a in gc_actions if a["action"] == "remove")
     n_cand = sum(1 for a in gc_actions if a["action"] == "candidate")
     log(f"아침 루틴{' [dry-run]' if dry_run else ''}: GC 제거 {n_removed} · "
@@ -563,7 +735,7 @@ def run_morning(root, now=None, post=True, runner=_run, log=_log, dry_run=False)
             SL.post(root, text)
         except Exception as e:
             log(f"Slack 전송 실패: {e}")
-    return {"gc": gc_actions, "digest": text}
+    return {"gc": gc_actions, "digest": text, "fork": fork_res}
 
 
 def _default_root():
