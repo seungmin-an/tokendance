@@ -118,10 +118,11 @@ def add_worktree(repo, path, ref):
 def reset_worktree(wt, ref):
     git(wt, "checkout", "--detach", "--force", ref)
     git(wt, "reset", "--hard", ref)
-    # NOTE: no -x — preserves gitignored build state (target/). A share the repo
-    # does NOT gitignore (npu-tools and .venv) is untracked, so this does remove
-    # it; acquire re-applies the shares right after, and is_dirty() ignores them
-    # so a slot still carrying one stays reusable.
+    # NOTE: no -x — preserves gitignored build state (target/), so acquire() can
+    # reuse the cache it just leased; release() deletes target/ separately.
+    # A share the repo does NOT gitignore (npu-tools and .venv) is untracked, so
+    # this does remove it; acquire re-applies the shares right after, and
+    # is_dirty() ignores them so a slot still carrying one stays reusable.
     git(wt, "clean", "-fd")
 
 
@@ -276,7 +277,11 @@ def acquire(repo, holder, root=None, busy_paths=None):
 
 
 def release(repo, path, root=None, *, expected_holder=None, busy_paths=None):
-    """Free a slot's lease and reset its worktree for the next holder.
+    """Free a slot's lease, reset its worktree and drop its build cache.
+
+    The reset leaves gitignored `target/` in place (see reset_worktree); we then
+    delete it, because a released slot has no holder left to reuse the cache and
+    it grows without bound otherwise — one npu-tools slot reached 115G.
 
     `busy_paths` lists slot paths a live session still occupies (same contract as
     acquire). For those the lease is freed but the worktree is left exactly as it
@@ -300,6 +305,12 @@ def release(repo, path, root=None, *, expected_holder=None, busy_paths=None):
                           f"freeing the lease without resetting the worktree", file=sys.stderr)
                 elif os.path.isdir(e["path"]):
                     reset_worktree(e["path"], ref)
+                    # reset_worktree's `clean -fd` has no -x, so the gitignored
+                    # build cache survives it. A released slot has no holder to
+                    # reuse the cache, and one npu-tools slot reached 115G, so
+                    # drop it here. Only on release: acquire() also calls
+                    # reset_worktree and must keep the cache it just leased.
+                    shutil.rmtree(target_dir(e), ignore_errors=True)
                 e["leased"] = False
                 e["lease_holder"] = ""
                 break
