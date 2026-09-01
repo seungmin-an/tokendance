@@ -416,15 +416,29 @@ class AcquireReleaseTest(unittest.TestCase):
         st = pool.load_state(pool.pool_dir(self.repo, self.tmp))
         self.assertEqual(len(st["entries"]), 1) # no second slot leaked
 
-    def test_warm_target_survives_release(self):
+    def test_release_drops_warm_target(self):
+        # 2026-09-01 contract change: a released slot has no holder left to reuse
+        # its build cache, and one npu-tools slot reached 115G, so release drops
+        # it. Replaces test_warm_target_survives_release, which asserted the
+        # opposite carry-over-the-cache behaviour.
         p1 = pool.acquire(self.repo, "task-1", root=self.tmp)
         os.makedirs(os.path.join(p1, "target"))
         with open(os.path.join(p1, "target", "warm.bin"), "w") as f:
             f.write("cache")
         pool.release(self.repo, p1, root=self.tmp)
+        self.assertFalse(os.path.exists(os.path.join(p1, "target")))
         p2 = pool.acquire(self.repo, "task-2", root=self.tmp)
-        self.assertEqual(p1, p2)  # reuses the same (only idle) slot
-        self.assertTrue(os.path.exists(os.path.join(p2, "target", "warm.bin")))
+        self.assertEqual(p1, p2)  # still reuses the same (only idle) slot
+
+    def test_busy_slot_keeps_warm_target_on_release(self):
+        # A live session may be mid-build: free the lease, leave its tree — and
+        # its cache — alone. Same guard that stops us resetting a human's HEAD.
+        p1 = pool.acquire(self.repo, "task-1", root=self.tmp)
+        os.makedirs(os.path.join(p1, "target"))
+        with open(os.path.join(p1, "target", "warm.bin"), "w") as f:
+            f.write("cache")
+        pool.release(self.repo, p1, root=self.tmp, busy_paths=[p1])
+        self.assertTrue(os.path.exists(os.path.join(p1, "target", "warm.bin")))
 
     def test_heal_reconciles_orphan_slot_after_lost_state(self):
         # Create slot "1", release it (dir + git registration remain), then wipe
