@@ -316,15 +316,38 @@ def cmd_attach(root, task_id, claude_bin=None,
     execer(tmux, session_name)
 
 
+# tmux runs a new-session window command through a shell and rejects an over-long
+# command string ("command too long"). The recall block rides in that string via
+# --append-system-prompt, so once the library grew past ~20KB every `td task open`
+# and `td review` for npu-tools failed outright. Spill past this size to a file.
+RECALL_INLINE_MAX = 4000
+
+
 def _recall_block(root, repo):
     """Library recall for a worker on `repo` — the same source launch-worker.sh
     injects (harvest_knowledge.recall_block, which `--recall` also calls).
+
+    A block over RECALL_INLINE_MAX bytes is written to state/recall/<repo>.md and
+    replaced by a pointer, because it reaches the worker through a tmux command
+    string that has a hard length limit.
     Best-effort: any failure yields "" so it never blocks provisioning."""
     try:
         import harvest_knowledge as HK
-        return HK.recall_block(root, os.path.abspath(repo))
+        block = HK.recall_block(root, os.path.abspath(repo))
     except Exception:
         return ""
+    if len(block.encode()) <= RECALL_INLINE_MAX:
+        return block
+    try:
+        d = os.path.join(root, "state", "recall")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, os.path.basename(os.path.normpath(repo)) + ".md")
+        with open(path, "w") as f:
+            f.write(block)
+    except OSError:
+        return ""
+    return ("## 참고 지식 (library)\n"
+            f"이 레포의 참고 지식이 `{path}` 에 있다. 작업 시작 전에 그 파일을 Read 하라.")
 
 
 DEFAULT_REVIEW_REPO = "/root/npu-tools"   # `td review` default target repo

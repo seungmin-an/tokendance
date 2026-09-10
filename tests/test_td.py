@@ -1153,3 +1153,56 @@ class BacklogCmdTest(unittest.TestCase):
         self.assertIn("backlog", out)
         for c in ("promote", "drop"):        # subcommands unique to backlog
             self.assertIn(c, out)
+
+
+class RecallSpillTest(unittest.TestCase):
+    """A grown library must not ride inline in the tmux new-session command string."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.repo = os.path.join(self.root, "some-repo")
+        os.makedirs(self.repo, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _recall(self, block):
+        fake = types.ModuleType("harvest_knowledge")
+        fake.recall_block = lambda root, repo: block
+        saved = sys.modules.get("harvest_knowledge")
+        sys.modules["harvest_knowledge"] = fake
+        try:
+            return td._recall_block(self.root, self.repo)
+        finally:
+            if saved is None:
+                del sys.modules["harvest_knowledge"]
+            else:
+                sys.modules["harvest_knowledge"] = saved
+
+    def test_small_block_stays_inline(self):
+        self.assertEqual(self._recall("tiny recall"), "tiny recall")
+        self.assertFalse(os.path.exists(os.path.join(self.root, "state", "recall")))
+
+    def test_oversized_block_spills_to_file_and_returns_pointer(self):
+        block = "x" * (td.RECALL_INLINE_MAX + 1)
+        out = self._recall(block)
+        spill = os.path.join(self.root, "state", "recall", "some-repo.md")
+        self.assertLess(len(out.encode()), td.RECALL_INLINE_MAX)   # short enough for tmux
+        self.assertIn(spill, out)                                  # points at the file
+        with open(spill) as f:
+            self.assertEqual(f.read(), block)                      # nothing is lost
+
+    def test_recall_failure_still_yields_empty(self):
+        fake = types.ModuleType("harvest_knowledge")
+        def boom(root, repo):
+            raise RuntimeError("ledger unreadable")
+        fake.recall_block = boom
+        saved = sys.modules.get("harvest_knowledge")
+        sys.modules["harvest_knowledge"] = fake
+        try:
+            self.assertEqual(td._recall_block(self.root, self.repo), "")
+        finally:
+            if saved is None:
+                del sys.modules["harvest_knowledge"]
+            else:
+                sys.modules["harvest_knowledge"] = saved
